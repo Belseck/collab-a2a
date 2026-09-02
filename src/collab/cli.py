@@ -3091,6 +3091,55 @@ def cmd_whoami(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_fold(args: argparse.Namespace) -> int:
+    """How much of a long message to show before «show more».
+
+    Yours, not the theme's, and it applies whichever theme is on — the same
+    arrangement as `collab color`. A theme names a number because folding is
+    part of how a conversation looks; but themes get shared, and telling one
+    person's file how much YOU want to read is the wrong place to say it.
+
+    `auto` gives the decision back rather than storing a number that happens to
+    match: a theme you switch to later should be able to bring its own.
+    """
+    from .config import FOLD_MAX, fold_override, set_fold_override
+
+    if args.value is None:
+        mine = fold_override()
+        if mine is None:
+            from .client.tui import _current_theme
+
+            print(f"auto — the theme decides ({_current_theme()['fold']} lines)")
+        elif mine == 0:
+            print("off — long messages are never folded")
+        else:
+            print(f"{mine} lines, then «show more»")
+        print(dim("  collab fold <n> · collab fold off · collab fold auto"))
+        return 0
+
+    said = args.value.strip().lower()
+    if said in ("auto", "none", "-"):
+        set_fold_override(None)
+        ok("folding is the theme's again")
+        return 0
+
+    try:
+        set_fold_override(0 if said == "off" else int(said))
+    except ValueError:
+        # NOT ROUNDED INTO SOMETHING NEARBY, and the old value is left exactly
+        # where it was: a command that refuses and half-applies is worse than
+        # one that refuses.
+        fail(f"«{args.value}» is not a number of lines")
+        print(dim(f"  a number from 0 to {FOLD_MAX}, or 'off', or 'auto'"))
+        return 2
+
+    if said == "off":
+        ok("long messages are never folded now")
+    else:
+        ok(f"folding at {int(said)} lines")
+    return 0
+
+
 def cmd_color(args: argparse.Namespace) -> int:
     """Choose the colour other people see you in, or clear it.
 
@@ -3750,6 +3799,13 @@ def build_parser() -> argparse.ArgumentParser:
     col.add_argument("value", nargs="?",
                      help="a hex colour like #00cccc, or 'none' to clear it")
     col.set_defaults(func=cmd_color)
+
+    fld = sub.add_parser("fold",
+                         help="how many lines of a long message to show")
+    fld.add_argument("value", nargs="?",
+                     help="a number of lines, 'off' to never fold, or 'auto' "
+                          "to let the theme decide")
+    fld.set_defaults(func=cmd_fold)
 
     d = sub.add_parser("daemon", help="manage the listener")
     d.add_argument("action", choices=["start", "stop", "status"], nargs="?", default="status")

@@ -65,9 +65,40 @@ def test_every_kind_the_renderer_special_cases_is_in_it(kind):
     assert any(e.kind == kind for e in demo.events())
 
 
-def test_something_in_it_is_long_enough_to_fold():
+@pytest.mark.parametrize("layout,fold", [("bubbles", 4), ("log", 1),
+                                         ("log", 2), ("log", 8)])
+def test_something_in_it_is_long_enough_to_fold(monkeypatch, layout, fold):
+    """A message long enough that ANY theme which folds draws a button on it.
+
+    THE FOLDING IS PINNED HERE, and it has to be. `conversation_rows` reads the
+    live theme and the reader's own override, and both of those belong to
+    whoever is running the tests: `classic` is the only built-in, it is the
+    default, and it ships `fold: 0`. So on a stock install — no themes folder,
+    no `theme` key — nothing folds and the assertion cannot pass, while on a
+    machine whose owner happens to use a folding theme it does. A test that
+    reports the tester's configuration is not reporting the demo.
+    """
+    resolved = dict(themes.DEFAULTS) | {"layout": layout, "fold": fold}
+    monkeypatch.setattr(tui, "_current_theme", lambda: resolved)
+    monkeypatch.setattr(tui, "fold_override", lambda: None)
+
     rows = conversation_rows(demo.events(), 80, demo.YOU)
     assert any(r.button for r in rows), "no «show more» to click"
+
+
+def test_nothing_folds_under_the_theme_that_actually_ships(monkeypatch):
+    """The other half of the same fact, said out loud rather than discovered.
+
+    `classic` does not fold, so the demo opens with no «show more» anywhere.
+    That is the shipped experience, and it is worth a test of its own so that
+    changing the built-in's `fold` is a decision somebody makes on purpose.
+    """
+    resolved = dict(themes.DEFAULTS) | themes.BUILTIN["classic"]
+    monkeypatch.setattr(tui, "_current_theme", lambda: resolved)
+    monkeypatch.setattr(tui, "fold_override", lambda: None)
+
+    rows = conversation_rows(demo.events(), 80, demo.YOU)
+    assert not any(r.button for r in rows)
 
 
 @pytest.mark.parametrize("hour,minute", [(0, 1), (0, 30), (7, 0), (13, 45),
@@ -125,6 +156,42 @@ def test_it_renders_under_every_built_in_theme(monkeypatch, built_in):
 def test_it_renders_at_every_width(width):
     rows = conversation_rows(demo.events(), width, demo.YOU)
     assert all(tui._w(r.text) <= width for r in rows)
+
+
+@pytest.mark.parametrize("width", [24, 30, 40, 56, 80, 200])
+@pytest.mark.parametrize("layout", ["log", "bubbles"])
+def test_it_renders_at_every_width_with_folding_on_too(monkeypatch, layout,
+                                                       width):
+    """The same claim, with the fold button drawn — which is where it failed.
+
+    `classic` at 40 columns produced a 52-column row: a 31-column indent with a
+    21-column «▸ show more (2 lines)» appended raw, while every header row
+    beside it went through `_clip`. It never showed because the shipped
+    `classic` has `fold: 0` and this row is never drawn — so the guard above,
+    which reads the live theme, only ever measured the unfolded case on a
+    stock install.
+    """
+    resolved = dict(themes.DEFAULTS) | {"layout": layout, "fold": 2}
+    monkeypatch.setattr(tui, "_current_theme", lambda: resolved)
+    monkeypatch.setattr(tui, "fold_override", lambda: None)
+
+    rows = conversation_rows(demo.events(), width, demo.YOU)
+    assert any(r.button for r in rows), "nothing folded — the test proves nothing"
+    assert all(tui._w(r.text) <= width for r in rows)
+
+
+@pytest.mark.parametrize("width", [24, 30, 40])
+def test_a_narrow_pane_keeps_the_whole_button_readable(monkeypatch, width):
+    """The indent gives way before the label does. A button clipped to
+    «▸ show m…» is still clickable and no longer says what it does."""
+    resolved = dict(themes.DEFAULTS) | {"layout": "log", "fold": 2}
+    monkeypatch.setattr(tui, "_current_theme", lambda: resolved)
+    monkeypatch.setattr(tui, "fold_override", lambda: None)
+
+    buttons = [r.text for r in conversation_rows(demo.events(), width, demo.YOU)
+               if r.button]
+    assert buttons
+    assert all("lines)" in b or "line)" in b for b in buttons)
 
 
 # --- the roster --------------------------------------------------------------

@@ -21,6 +21,20 @@ from collab.client.tui import (V_RAIL, V_THUMB, V_UNLOADED, Gutter, Pane, Row,
 from test_tui_scroll import _tui
 
 
+def _theme(monkeypatch, **declared):
+    """A resolved theme with `declared` on top of the shipped defaults.
+
+    Through the same door the viewer uses, so a test cannot pass by reading a
+    setting the renderer never consults.
+    """
+    from collab import themes
+    from collab.client import tui as _t
+
+    resolved = dict(themes.DEFAULTS) | declared
+    monkeypatch.setattr(_t, "_current_theme", lambda: resolved)
+    return resolved
+
+
 # --- the strokes -------------------------------------------------------------
 
 def test_the_column_uses_the_vertical_strokes():
@@ -58,6 +72,50 @@ def test_an_unmeasured_pane_gets_none():
     put a bar on every pane in the window for one frame."""
     tui = _tui()
     tui.roster.rows, tui.roster.total = 0, 40
+    assert tui._gutter_width(tui.roster) == 0
+
+
+def test_off_takes_the_column_from_a_pane_that_would_have_one(monkeypatch):
+    """The reader is allowed not to want it. Nothing else moves: every key
+    that scrolls still scrolls, and the bottom bar is a separate decision."""
+    tui = _tui()
+    tui.roster.rows, tui.roster.total = 6, 40
+    _theme(monkeypatch, scrollbar_side="off")
+    assert tui._gutter_width(tui.roster) == 0
+
+
+def test_always_keeps_the_column_on_a_pane_that_fits(monkeypatch):
+    """A rail with the thumb filling it, saying «this is all of it» — the
+    reading `auto` will not spend a column on and this one will."""
+    tui = _tui()
+    tui.roster.rows, tui.roster.total = 20, 6
+    _theme(monkeypatch, scrollbar_side="always")
+    assert tui._gutter_width(tui.roster) == 1
+
+
+def test_always_still_gives_nothing_to_a_pane_with_no_height(monkeypatch):
+    """Before the first frame there is no pane to draw beside. «Always» is a
+    matter of taste, not a licence to paint into a pane that is not there."""
+    tui = _tui()
+    tui.roster.rows, tui.roster.total = 0, 40
+    _theme(monkeypatch, scrollbar_side="always")
+    assert tui._gutter_width(tui.roster) == 0
+
+
+def test_the_shipped_default_is_what_the_viewer_already_did(monkeypatch):
+    """`auto`, deliberately: naming an existing behaviour is not changing it.
+
+    If this fails, someone made every pane in every default install one column
+    narrower — which is a decision, and should be made on purpose.
+    """
+    from collab import themes
+
+    assert themes.DEFAULTS["scrollbar_side"] == "auto"
+    tui = _tui()
+    _theme(monkeypatch)                        # nothing declared
+    tui.roster.rows, tui.roster.total = 6, 40
+    assert tui._gutter_width(tui.roster) == 1
+    tui.roster.rows, tui.roster.total = 20, 6
     assert tui._gutter_width(tui.roster) == 0
 
 

@@ -16,8 +16,8 @@ import random
 import subprocess
 import unicodedata
 
-from ..config import (HEADER_SEPARATOR, default_color, parse_color,
-                      resolve_name,
+from ..config import (HEADER_SEPARATOR, default_color, fold_override,
+                      parse_color, resolve_name,
                       hex_to_rgb, rgb_to_256, theme)
 import datetime as _dt
 import re
@@ -417,6 +417,22 @@ def _current_theme() -> dict:
         _THEME_CACHE.update(key=(chosen, stamp), theme=themes.resolve(chosen),
                             version=_THEME_CACHE.get("version", 0) + 1)
     return _THEME_CACHE["theme"]
+
+
+def effective_fold() -> int:
+    """The folding actually in force: the reader's word over the theme's.
+
+    A theme decides how a conversation LOOKS and folding is part of that, so
+    every theme names a number. But the person reading is the one who knows
+    whether they want four lines or the whole message, and saying so should not
+    mean editing a theme file somebody else wrote and shared.
+
+    Compared against None and not for truth: an override of 0 means «never
+    fold», and `if override:` reads that as «nothing set» and hands the
+    decision straight back to the theme it was meant to overrule.
+    """
+    mine = fold_override()
+    return int(_current_theme()["fold"]) if mine is None else mine
 
 
 def _colour_stamp() -> tuple:
@@ -921,6 +937,13 @@ def scroll_track(width: int, offset: int, rows: int, total: int, *,
     """
     rail, thumb_glyph, unloaded = glyphs
     width = max(width, 1)
+    # AN OFFSET OUTSIDE THE CONVERSATION IS BROUGHT BACK INTO IT HERE. Every
+    # caller runs `Pane.clamp` first, so this cannot be reached today — but
+    # «cannot be reached» is a fact about the callers, checked by reading them,
+    # and it stops being true the first time somebody adds a caller. Without
+    # it a negative offset walks `start` off the front of the list and raises
+    # IndexError, and a large one reports a percentage above 100.
+    offset = min(max(offset, 0), max(total - rows, 0))
     if total <= 0 or rows <= 0 or total <= rows:
         # Everything LOADED fits on the screen, so the thumb is the whole rail.
         # Which is not the same as «this is the whole conversation» — the marks
@@ -946,9 +969,14 @@ def scroll_track(width: int, offset: int, rows: int, total: int, *,
 
 
 def scroll_percent(offset: int, rows: int, total: int) -> int:
-    """How far down the loaded conversation the screen is."""
+    """How far down the loaded conversation the screen is.
+
+    Clamped for the same reason the track is: 0–100 should be a property of
+    this function, not a promise every caller has to keep on its behalf.
+    """
     if total <= rows:
         return 100
+    offset = min(max(offset, 0), total - rows)
     return int(round(100 * offset / max(total - rows, 1)))
 
 
@@ -1003,17 +1031,59 @@ _KEY_HINTS = (
 )
 
 
+def _bar_without_track(width: int, *, behind: int, following: bool) -> Bar:
+    """The same line with the scrollbar taken out of it.
+
+    Not `bottom_bar` with a zero-width track: a track of `(0, 0)` is what the
+    click handler reads as «there is nothing here», and building the line
+    around an empty span would leave every column shifted by a rail that is
+    not drawn — a button one place from where the bar says it is.
+
+    The key names take the room the rail was defending. MIN_TRACK existed to
+    stop the bar losing the only thing on it that could not be replaced by
+    knowing the keys; with no rail to protect, a narrow line spends what it
+    has on saying how to leave.
+    """
+    label = "" if following else (f"[⤓ {behind} new]" if behind
+                                  else "[⤓ newest]")
+    for keys in _KEY_HINTS:
+        text = keys.strip()
+        shown = label
+        line = f" {text}" if text else ""
+        if shown and _w(line) + _w(f"   {shown}") > width:
+            shown = ""
+        if not shown:
+            if _w(line) <= width:
+                return Bar(line=line, track=(0, 0))
+            continue
+        pad = width - _w(line) - _w(shown)
+        start = _w(line) + pad
+        return Bar(line=line + " " * pad + shown, track=(0, 0),
+                   button=(start, start + _w(shown)))
+    return Bar(line="", track=(0, 0))
+
+
 def bottom_bar(width: int, *, offset: int, rows: int, total: int,
                behind: int = 0, following: bool = True,
-               more_above: bool = False, more_below: bool = False) -> Bar:
+               more_above: bool = False, more_below: bool = False,
+               track: str = "always") -> Bar:
     """Compose the bottom line for a pane this wide.
 
     Everything on it is optional except the track. As the pane narrows the key
     names go first —they are a reminder, and the keys work whether or not they
     are printed— then the percentage, then the button; the scrollbar is what is
     left standing at twenty-four columns.
+
+    UNLESS THE READER SAID NOT TO. `track` is `always`, `auto` —only where
+    there is somewhere to travel— or `off`. With no rail the percentage goes
+    with it: it measured the same thing, and a number nobody asked for is not
+    a smaller version of a picture nobody asked for. What stays is the line of
+    key names the bar grew out of, and the button, which is still the only
+    control in the viewer a mouse can reach.
     """
     width = max(width, 1)
+    if track == "off" or (track == "auto" and total <= rows):
+        return _bar_without_track(width, behind=behind, following=following)
     # NOWHERE TO JUMP, NOTHING TO CLICK. Following the live end, a button
     # labelled «newest» would do nothing when pressed, and a control that does
     # nothing teaches people the bar is decorative.
@@ -1483,13 +1553,26 @@ def classic_rows(env: Envelope, width: int, me: str,
     else:
         rows = [Row(head + first_line, _tone(first_line), dim, seq, False, pair)]
     for extra in shown[1:]:
-        rows.append(Row(indent + extra, _tone(extra), dim, seq, False, pair))
+        rows.append(Row(_clip(indent + extra, width), _tone(extra), dim, seq,
+                        False, pair))
     if hidden:
         plural = "line" if hidden == 1 else "lines"
         label = ("▾ show less" if open_now
                     else f"▸ show more ({hidden} {plural})")
-        rows.append(Row(indent + label, C_BUTTON, curses.A_BOLD, seq, True,
-                        pair))
+        # THE INDENT GIVES WAY, NOT THE LABEL. This row is a control, and the
+        # indent under it is decoration that lines it up with the text above;
+        # `_clip` alone would spend the narrow pane on the alignment and cut
+        # the button down to «▸ show m…», which is neither readable nor
+        # obviously a button.
+        #
+        # It goes wrong only where the header column is wide and the pane is
+        # not: `classic` at 40 columns put a 31-column indent in front of a
+        # 21-column label and returned a row of 52. Nobody met it because the
+        # shipped `classic` has `fold: 0` and never draws this row at all —
+        # until `collab fold` made every theme able to.
+        room = max(width - _w(label), 0)
+        rows.append(Row(_clip(indent[:room] + label, width), C_BUTTON,
+                        curses.A_BOLD, seq, True, pair))
     return rows
 
 
@@ -1565,7 +1648,7 @@ def conversation_rows(events, width: int, me: str,
     # viewer. Read once, changing theme would mean closing it, and whoever
     # tried would think the command does nothing.
     T = _current_theme()
-    fold = int(T["fold"])
+    fold = effective_fold()
     # BY THE LAYOUT IT DECLARES, not by what it is called. With `if theme ==
     # "classic"` any user theme extending classic came out in bubbles: it
     # inherited everything except the one thing that was actually checked.
@@ -2035,7 +2118,7 @@ class Tui:
         win.refresh()
 
     def _gutter_width(self, pane: "Pane") -> int:
-        """One column, or none when there is nothing to scroll.
+        """One column, or none — by what the theme asks for.
 
         Decided from the row count the LAST frame arrived at. Deciding it from
         this frame's would mean laying the conversation out twice at two
@@ -2046,8 +2129,20 @@ class Tui:
         The one-frame lag cannot oscillate: taking a column away only ever
         makes text wrap into MORE rows, never fewer, so a pane that needs the
         bar still needs it once it has it.
+
+        A PANE WITH NO HEIGHT GETS NOTHING, WHATEVER THE SETTING SAYS. `always`
+        is a preference about a pane you can see; before the first frame there
+        is none to draw beside, and honouring it there would put a bar on every
+        pane in the window for one frame.
         """
-        return 1 if pane.total > pane.rows > 0 else 0
+        if pane.rows <= 0:
+            return 0
+        mode = _current_theme()["scrollbar_side"]
+        if mode == "off":
+            return 0
+        if mode == "always":
+            return 1
+        return 1 if pane.total > pane.rows else 0
 
     def _paint_gutter(self, win, x: int, top: int, rows: int, pane: "Pane", *,
                       more_above: bool = False,
@@ -2083,7 +2178,8 @@ class Tui:
             total=self.chat.total, behind=self.behind(),
             following=self.chat.follow,
             more_above=self.model.more_above(),
-            more_below=bool(self.model.pending()))
+            more_below=bool(self.model.pending()),
+            track=_current_theme()["scrollbar_bottom"])
         return self._bar
 
     def _hint(self, win, height: int, width: int) -> None:

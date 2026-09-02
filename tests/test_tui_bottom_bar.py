@@ -289,3 +289,117 @@ def test_the_key_and_the_button_do_the_same_thing(key, monkeypatch):
 def test_a_single_pane_view_has_a_bar_too():
     tui = _drawn(view="chat")
     assert tui._bar.track[1] > tui._bar.track[0]
+
+
+# --- columns, not characters -------------------------------------------------
+
+def test_the_button_span_survives_a_wide_glyph_on_the_bar():
+    """`len` and `_w` agree on every glyph the bar draws today — `↑ ↓ · ⤓ ━ █
+    ┄` all measure one column — so the two are indistinguishable and a
+    mutation swapping them survives. That is not the code being right; it is
+    the test being unable to tell them apart. One wide character in a key hint
+    and the button's recorded span drifts from where it is drawn.
+
+    So the claim is made against a bar that has one.
+    """
+    from collab.client import tui as _t
+
+    def at_column(line: str, column: int) -> str:
+        """What is drawn from `column` rightwards.
+
+        Walked, not sliced. `line[column:]` is a slice by CHARACTER, and the
+        whole point of the span being in columns is that with a wide glyph on
+        the line the two stop agreeing — a test that slices is a test that
+        cannot see the bug it was written for.
+        """
+        seen = 0
+        for i, ch in enumerate(line):
+            if seen == column:
+                return line[i:]
+            seen += _t._w(ch)
+        return ""
+
+    wide = (" 上下 scroll · [ ] roster · q quit", " q quit", "")
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(_t, "_KEY_HINTS", wide)
+        for width in range(24, 100):
+            bar = _t.bottom_bar(width, offset=40, rows=10, total=200,
+                                behind=3, following=False)
+            assert _t._w(bar.line) <= width, f"over-runs at {width}"
+            start, end = bar.button
+            if end > start:
+                assert at_column(bar.line, start).startswith("[⤓"), (
+                    f"the span points at column {start}, the label is not there"
+                    f" — width {width}")
+                assert end - start == _t._w("[⤓ 3 new]")
+
+
+# --- whether the track is drawn at all ---------------------------------------
+
+def _railed(track, *, width=80, offset=40, rows=10, total=200, following=False,
+         behind=3):
+    return bottom_bar(width, offset=offset, rows=rows, total=total,
+                      behind=behind, following=following, track=track)
+
+
+def test_off_removes_the_rail_and_leaves_the_line():
+    """A bar with no scrollbar on it is the line of key names we already had —
+    which is a line worth keeping. The keys are still the keys, and the button
+    is still the only thing in the viewer you can click to get back."""
+    bar = _railed("off")
+
+    assert bar.track == (0, 0), "nothing to resolve a click against"
+    assert RAIL not in bar.line and THUMB not in bar.line
+    assert "%" not in bar.line, "the percentage goes with the rail it belonged to"
+    assert "quit" in bar.line, "the keys stay"
+    assert bar.button[1] > bar.button[0], "and so does the button"
+
+
+def test_the_button_off_the_rail_is_still_where_the_bar_says_it_is():
+    """The span is what the click handler goes on. With the rail gone every
+    column shifts left, and a button whose recorded span did not shift with it
+    is a button that misses by the width of a scrollbar."""
+    bar = _railed("off")
+    start, end = bar.button
+
+    assert bar.line[start:end].strip() == "[⤓ 3 new]"
+
+
+def test_off_keeps_the_line_within_its_width():
+    for width in range(24, 120):
+        assert len(_railed("off", width=width).line) <= width
+
+
+def test_auto_draws_the_rail_only_when_there_is_travel():
+    """The same question `auto` answers on the side: is there anywhere to go?
+    A full rail over a conversation that fits says «nothing to scroll», and
+    spends a quarter of a narrow bar saying it."""
+    travelling = _railed("auto", rows=10, total=200)
+    assert travelling.track[1] > 0
+
+    settled = _railed("auto", rows=200, total=10)
+    assert settled.track == (0, 0)
+    assert THUMB not in settled.line
+
+
+def test_always_draws_the_rail_even_with_nowhere_to_go():
+    bar = _railed("always", rows=200, total=10)
+    assert bar.track[1] > 0
+    assert THUMB in bar.line
+
+
+def test_always_is_the_shipped_default_for_the_bottom():
+    """Unlike the side one. The bottom bar has drawn its rail unconditionally
+    since it existed, and the default is that behaviour under a name."""
+    from collab import themes
+
+    assert themes.DEFAULTS["scrollbar_bottom"] == "always"
+    assert _railed("always").line == bottom_bar(
+        80, offset=40, rows=10, total=200, behind=3, following=False).line
+
+
+def test_a_narrow_bar_with_no_rail_still_says_how_to_leave():
+    """The width MIN_TRACK used to defend goes to the keys instead of being
+    the reason the whole line is dropped."""
+    bar = _railed("off", width=26)
+    assert "quit" in bar.line

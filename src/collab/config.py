@@ -562,6 +562,48 @@ def set_theme(name: str) -> str | None:
     return n
 
 
+#: The widest folding worth storing. Matched to the theme setting's own range
+#: so the two cannot come to disagree about what a number means.
+FOLD_MAX = 1000
+
+
+def fold_override() -> int | None:
+    """How many lines before «show more» — if the reader has said at all.
+
+    NONE IS NOT ZERO. Zero is a choice, «never fold»; None is «the theme
+    decides». A setting that collapsed the two would leave `collab fold auto`
+    with nothing to express and make `collab fold off` indistinguishable from
+    never having run the command.
+    """
+    value = load_config().get("fold")
+    # A bool is an int in Python and `fold: true` is not a number of lines.
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return value if 0 <= value <= FOLD_MAX else None
+
+
+def set_fold_override(value: int | None) -> int | None:
+    """Store it, or clear it with None. Raises rather than approximating.
+
+    The rule the theme parser already follows: what cannot be understood is
+    reported, never rounded to something adjacent. Whoever typed a mistake has
+    to hear about it instead of receiving a folding they did not ask for and
+    cannot account for.
+    """
+    cfg = load_config()
+    if value is None:
+        cfg.pop("fold", None)
+        save_config(cfg)
+        return None
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"«{value}» is not a number of lines")
+    if not 0 <= value <= FOLD_MAX:
+        raise ValueError(f"{value} is outside 0–{FOLD_MAX}")
+    cfg["fold"] = value
+    save_config(cfg)
+    return value
+
+
 
 def agent_identity(cwd=None, name: str = "") -> dict:
     """This agent's own name and colour, from its own state directory.
