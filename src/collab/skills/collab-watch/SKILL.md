@@ -128,9 +128,30 @@ pointer is over — the roster at the top, the conversation below.
 | `Home` `g` | the start of the conversation |
 | `q` | quit the viewer (the session keeps running) |
 
+The mouse works on three things and nothing else, so reading is never
+interrupted by an accidental selection:
+
+| | |
+|---|---|
+| `▸ show more` | click it to unfold that message, click again to fold it |
+| either scrollbar | click anywhere on the rail to jump to that part of the pane |
+| `[⤓ newest]` | click to go back to the live end — it appears only while you are behind |
+
+Each pane draws its own scrollbar down its right edge, and only when its
+content does not fit: nothing to scroll, no bar, and the column stays with the
+text. It is not tmux's `pane-scrollbars` (3.6 and later) and cannot be — that
+one measures tmux's own scrollback, and a full-screen program like this one
+runs on the alternate screen, where tmux records no history and the bar comes
+out permanently full. It could not know this position anyway: the conversation
+is a window of messages over a log on disk, which tmux has never seen.
+
 The conversation follows new messages until you scroll back; `End` (or `G`)
-resumes following, and while you are away the footer says how many messages are
-waiting below. The roster header shows `▴▾` when there is more above or below.
+resumes following. The bottom line is a scrollbar: the rail is what is loaded,
+the block on it is what you are looking at, and a `┄` at either end means the
+conversation carries on past what is in memory. Beside it, the percentage, and
+— while you are scrolled back — a button that says how many messages arrived
+while you were reading. The roster header shows `▴▾` when there is more above
+or below.
 
 **History is not all loaded at once.** The pane opens on the last few messages
 and holds a window of them — what is loaded is what it costs to draw, so the
@@ -138,6 +159,27 @@ window is bounded and the log on disk is not. Scrolling past either edge slides
 it, a page at a time; `Home` and `End` go to the ends directly. The header says
 `older above` while there is more behind you. `collab watch --limit N` opens on
 more of it if you would rather start further back.
+
+## Looking at the viewer without a session
+
+```bash
+collab watch --demo
+```
+
+Opens the ordinary viewer on a conversation that is not happening: the same
+panes, keys and renderer, reading a log that lives in memory. Nothing is
+fetched, nothing is written, and no session is joined.
+
+It is what to use when the question is about the VIEWER rather than about a
+conversation — trying a theme, checking that folding works, seeing how the
+bubbles behave in a narrow pane. The simulated conversation is built to contain
+the awkward cases on purpose: a message long enough to fold, lines the tone
+rules paint, a name in Japanese, an attachment, a task, a change of day, and
+more history than fits in the window.
+
+```bash
+collab theme chat && collab watch --demo    # try a theme on something real
+```
 
 ## What the roster tells you
 

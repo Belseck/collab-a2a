@@ -576,7 +576,7 @@ def set_stats_source(command: str | None = None,
 
 #: The levels of the xterm-256 6x6x6 cube. They are not linear —they jump from
 #: 0 to 95— so the closest 256-colour to a hex has to be searched for, not
-#: dividiendo entre 51.
+#: arrived at by dividing by 51.
 _LEVELS = (0, 95, 135, 175, 215, 255)
 
 
@@ -696,6 +696,48 @@ def set_theme(name: str) -> str | None:
     return n
 
 
+#: The widest folding worth storing. Matched to the theme setting's own range
+#: so the two cannot come to disagree about what a number means.
+FOLD_MAX = 1000
+
+
+def fold_override() -> int | None:
+    """How many lines before «show more» — if the reader has said at all.
+
+    NONE IS NOT ZERO. Zero is a choice, «never fold»; None is «the theme
+    decides». A setting that collapsed the two would leave `collab fold auto`
+    with nothing to express and make `collab fold off` indistinguishable from
+    never having run the command.
+    """
+    value = load_config().get("fold")
+    # A bool is an int in Python and `fold: true` is not a number of lines.
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return value if 0 <= value <= FOLD_MAX else None
+
+
+def set_fold_override(value: int | None) -> int | None:
+    """Store it, or clear it with None. Raises rather than approximating.
+
+    The rule the theme parser already follows: what cannot be understood is
+    reported, never rounded to something adjacent. Whoever typed a mistake has
+    to hear about it instead of receiving a folding they did not ask for and
+    cannot account for.
+    """
+    cfg = load_config()
+    if value is None:
+        cfg.pop("fold", None)
+        save_config(cfg)
+        return None
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"«{value}» is not a number of lines")
+    if not 0 <= value <= FOLD_MAX:
+        raise ValueError(f"{value} is outside 0–{FOLD_MAX}")
+    cfg["fold"] = value
+    save_config(cfg)
+    return value
+
+
 
 def agent_identity(cwd=None, name: str = "") -> dict:
     """This agent's own name and colour, from its own state directory.
@@ -808,6 +850,24 @@ def _as_int(text: str) -> int:
         raise ValueError("expected a whole number") from None
 
 
+def _fold_value(text: str) -> int | None:
+    """A number of lines, `off` for none of them, or `auto` for the theme's.
+
+    None is the value that CLEARS the key, and it is `auto` — not zero. Zero
+    means «never fold», which somebody can choose; `auto` means they have not
+    chosen and the theme still decides.
+    """
+    value = text.strip().lower()
+    if value in ("auto", "none", "-", ""):
+        return None
+    if value == "off":
+        return 0
+    try:
+        return int(value)
+    except ValueError:
+        raise ValueError("expected a whole number, off, or auto") from None
+
+
 def _as_list(text: str) -> list[str]:
     """Commas or spaces, either way. An empty string is an empty list.
 
@@ -909,6 +969,14 @@ def settings() -> tuple[Setting, ...]:
         Setting("theme", "how the conversation is laid out in `collab watch`",
                 DEFAULT_THEME, str,
                 theme, _write_theme),
+        # SHOWN AS «auto» WHEN THERE IS NOTHING SET, because that is what is
+        # true: the theme decides. Reporting a number here would name one the
+        # reader never chose and cannot find in any theme they are using.
+        Setting("fold", "lines of a long message before «show more», over "
+                        "whatever the theme says (`collab fold` sets it)",
+                "auto", _fold_value,
+                lambda: "auto" if fold_override() is None else fold_override(),
+                lambda v: set_fold_override(v)),
         Setting("share_stats", "publish your quota and spend to the session",
                 SHARE_STATS_DEFAULT, _as_bool,
                 share_stats_enabled,

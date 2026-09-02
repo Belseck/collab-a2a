@@ -25,6 +25,11 @@ class FakeModel:
         self.events = []
         self.snapshot = {}
         self.status = {}
+        #: What the bottom row asks the model for. Empty rather than absent:
+        #: a stand-in that raises AttributeError where the real one answers
+        #: «nothing to report» makes every test that draws that row fail for a
+        #: reason that has nothing to do with what it was checking.
+        self.own_stats: dict = {}
         #: What is on disk either side of the loaded window, and what the
         #: viewer did about it.
         self.older = older

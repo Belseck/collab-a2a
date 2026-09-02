@@ -20,6 +20,11 @@ VISUALES = {
     "layout", "fold", "bubble_share", "bubble_max_share",
     "bubble_min", "narrow_at", "frame", "header", "text", "own_side",
     "group_by_author", "day_separators", "tones", "chars",
+    # Whether the scrollbar is drawn is a matter of taste like any other: it
+    # changes what a pane LOOKS like and nothing about what the viewer does.
+    # Hiding it hides a picture of where you are — never the ability to get
+    # there, since every key that scrolls still scrolls.
+    "scrollbar_side",
 }
 
 HOSTIL = """---

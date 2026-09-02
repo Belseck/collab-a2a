@@ -16,8 +16,8 @@ import random
 import subprocess
 import unicodedata
 
-from ..config import (HEADER_SEPARATOR, default_color, parse_color,
-                      resolve_name,
+from ..config import (HEADER_SEPARATOR, default_color, fold_override,
+                      parse_color, resolve_name,
                       hex_to_rgb, rgb_to_256, theme)
 import datetime as _dt
 import re
@@ -129,6 +129,13 @@ C_BAD = 8
 C_WARNLINE = 9
 C_INFO = 20      # blue · data, commands, figures
 C_BUTTON = 21
+#: AND THAT BLUE AS A HEX, not as `curses.COLOR_BLUE`. The terminal's blue is
+#: whatever its palette says it is, and on the usual dark ground that is navy:
+#: the commands and figures an information line is made of came out darker than
+#: the frame around them. This one is the same hue and readable on both grounds.
+#: Terminals that cannot redefine a colour get the nearest of the 256, and the
+#: eight-colour ones fall back to COLOR_BLUE, which is what they had anyway.
+INFO_HEX = "#4888db"
 C_TEXT = 22      # white · the body of a message that says nothing special
 
 #: How many lines of a message show before it folds, and how much of the width
@@ -255,8 +262,8 @@ _OTHERS: set[str] = set()
 
 #: And the pairs we had to create for those colours, since they do not come
 #: from the palette: `curses.init_pair` has to be called once per new colour.
-_PARES_LIBRES: dict[int, int] = {}
-_PROXIMO_PAR = [C_SPEAKER_BASE + 40]
+_PAIRS_BY_COLOUR: dict[int, int] = {}
+_NEXT_PAIR = [C_SPEAKER_BASE + 40]
 
 
 def record_colours(personas) -> None:
@@ -290,7 +297,7 @@ def record_colours(personas) -> None:
 #: Indices we have redefined to serve an exact hex. Taken from the top —255
 #: downwards— so as not to tread on the 216 of the cube, which is what
 #: everything else in the terminal uses.
-_PROXIMO_SLOT = [255]
+_NEXT_SLOT = [255]
 
 
 def _colour_index(value) -> int:
@@ -307,10 +314,10 @@ def _colour_index(value) -> int:
     # IT GOES THROUGH parse_color, which understands name, index, hex, rgb()
     # A theme value is either a hex colour or a variable; parse_color
     # is what turns the first into something curses can use.
-    entendido = parse_color(str(value))
-    if isinstance(entendido, int):
-        return entendido
-    rgb = hex_to_rgb(entendido) if entendido else None
+    parsed = parse_color(str(value))
+    if isinstance(parsed, int):
+        return parsed
+    rgb = hex_to_rgb(parsed) if parsed else None
     if rgb is None:
         # -1 IS THE TERMINAL'S DEFAULT COLOUR, and the only honest thing to
         # return here. It used to return C_TEXT, which is a PAIR ID used as a
@@ -318,27 +325,27 @@ def _colour_index(value) -> int:
         # a colour that came out dark green (colour 22 = #005f00)
         # instead of the white that was meant.
         return -1
-    aprox = rgb_to_256(*rgb)
+    nearest = rgb_to_256(*rgb)
     try:
-        puede = curses.can_change_color() and curses.COLORS >= 256
+        can_redefine = curses.can_change_color() and curses.COLORS >= 256
     except (curses.error, ValueError):
-        puede = False
-    if not puede:
-        return aprox
+        can_redefine = False
+    if not can_redefine:
+        return nearest
     # Keyed by the NORMALISED hex and not by the raw string: «#00cccc» and
     # «00cccc» are the same colour and took two of the ~24 slots there are.
-    if entendido in _HEX_SLOTS:
-        return _HEX_SLOTS[entendido]
-    slot = _PROXIMO_SLOT[0]
+    if parsed in _HEX_SLOTS:
+        return _HEX_SLOTS[parsed]
+    slot = _NEXT_SLOT[0]
     if slot <= 231:                       # we have used up the free ones
-        return aprox
-    _PROXIMO_SLOT[0] -= 1
+        return nearest
+    _NEXT_SLOT[0] -= 1
     try:
         # curses speaks in thousandths, not in 0-255.
         curses.init_color(slot, *(round(c * 1000 / 255) for c in rgb))
     except (curses.error, ValueError):
-        return aprox
-    _HEX_SLOTS[entendido] = slot
+        return nearest
+    _HEX_SLOTS[parsed] = slot
     return slot
 
 
@@ -348,19 +355,19 @@ _HEX_SLOTS: dict[str, int] = {}
 def _pair_for(value) -> int:
     """The curses pair for a colour that is not in the palette."""
     color = _colour_index(value)
-    if color not in _PARES_LIBRES:
-        par = _PROXIMO_PAR[0]
-        _PROXIMO_PAR[0] += 1
+    if color not in _PAIRS_BY_COLOUR:
+        pair = _NEXT_PAIR[0]
+        _NEXT_PAIR[0] += 1
         try:
-            curses.init_pair(par, color, -1)
+            curses.init_pair(pair, color, -1)
         except (curses.error, ValueError):
             # ValueError, not only curses.error: with the terminal not yet
             # initialised, or the index out of range, curses raises ValueError
             # and the narrower catch did not see it. One odd colour took the
             # WHOLE viewer down instead of falling back to white.
             return C_TEXT
-        _PARES_LIBRES[color] = par
-    return _PARES_LIBRES[color]
+        _PAIRS_BY_COLOUR[color] = pair
+    return _PAIRS_BY_COLOUR[color]
 
 
 def _speaker_pair(name: str) -> int:
@@ -460,6 +467,22 @@ def _current_theme() -> dict:
         _THEME_CACHE.update(key=(chosen, stamp), theme=themes.resolve(chosen),
                             version=_THEME_CACHE.get("version", 0) + 1)
     return _THEME_CACHE["theme"]
+
+
+def effective_fold() -> int:
+    """The folding actually in force: the reader's word over the theme's.
+
+    A theme decides how a conversation LOOKS and folding is part of that, so
+    every theme names a number. But the person reading is the one who knows
+    whether they want four lines or the whole message, and saying so should not
+    mean editing a theme file somebody else wrote and shared.
+
+    Compared against None and not for truth: an override of 0 means «never
+    fold», and `if override:` reads that as «nothing set» and hands the
+    decision straight back to the theme it was meant to overrule.
+    """
+    mine = fold_override()
+    return int(_current_theme()["fold"]) if mine is None else mine
 
 
 def _colour_stamp() -> tuple:
@@ -636,11 +659,11 @@ class Model:
         #
         # The roster settles it: an entry with a different participant id is a
         # different person, whatever it is called.
-        mi_id = getattr(self.profile, "participant_id", "") or ""
+        my_id = getattr(self.profile, "participant_id", "") or ""
         _OTHERS.clear()
         _OTHERS.update(p["name"] for p in people
                        if p.get("name") and p.get("id")
-                       and p.get("id") != mi_id)
+                       and p.get("id") != my_id)
 
         # MY OWN NAMES ARE CLEARED BEFORE THE ROSTER SPEAKS, so whatever
         # survives is what the roster put there THIS TIME. Without it,
@@ -921,6 +944,112 @@ _WARN = re.compile(r"⚠|\bAVISO\b|\bOJO\b|\bPENDIENTE\b|\bWARN\w*\b|"
 _DATA = re.compile(r"^\s*([`|+#-]|\w+\s*=|(git|python3?|node|bash|npm|collab|tmux)\b)", re.I)
 
 
+#: WHAT COUNTS AS «the left button went down here».
+#:
+#: Not RELEASED, which would fire a second time for the same click. And the
+#: double and triple variants ARE included, because ncurses does not report two
+#: quick clicks as two clicks: it coalesces them into ONE event under a
+#: different name, and a mask that lists only PRESSED and CLICKED silently
+#: ignores it. Measured on a real terminal — a click, then a second one a
+#: moment later, arrived as `0x8` and nothing happened. Which is the failure
+#: this whole file is about: a button that works until somebody clicks it
+#: twice, and then looks broken to exactly the person who is trying hardest.
+_CLICK = (curses.BUTTON1_PRESSED | curses.BUTTON1_CLICKED
+          | getattr(curses, "BUTTON1_DOUBLE_CLICKED", 0)
+          | getattr(curses, "BUTTON1_TRIPLE_CLICKED", 0))
+
+#: The strokes of the scrollbar, drawn DOWN a column: a rail, the part of it
+#: you are looking at, and an end that says the conversation does not stop
+#: where the rail does.
+#:
+#: `scroll_track` is written for either axis because it once served two — there
+#: was a horizontal one along the bottom row as well. That row belongs to the
+#: status bar, which says more with it, so the position is told down the side
+#: and nowhere else. The `glyphs` argument stays: the arithmetic has no opinion
+#: about which way it is drawn, and a caller that wants the other axis needs no
+#: second copy of it.
+V_RAIL, V_THUMB, V_UNLOADED = "┆", "█", "┊"
+
+#: WHY TMUX'S OWN SCROLLBAR IS NOT USED FOR THIS.
+#:
+#: tmux grew `pane-scrollbars` in 3.6, and it is the wrong tool here three
+#: times over. It measures TMUX'S scrollback; the viewer is a curses app, so it
+#: runs on the alternate screen, where tmux adds nothing to history — the thumb
+#: is computed from `screen_size_y + screen_hsize`, and with no history that is
+#: a bar permanently full, saying «nothing to scroll» over a conversation you
+#: are halfway up. Upstream treats showing it there as a bug and is removing
+#: it. And even working perfectly it could not answer the question: this
+#: conversation is a window of messages held in memory over a log on disk, and
+#: tmux has never seen either. Only this process knows where the reader is.
+
+def scroll_track(width: int, offset: int, rows: int, total: int, *,
+                 more_above: bool = False, more_below: bool = False,
+                 glyphs: tuple[str, str, str] = (V_RAIL, V_THUMB,
+                                                 V_UNLOADED)) -> str:
+    """The scrollbar, as `width` columns of text.
+
+    It measures WHAT IS LOADED, which is not the whole conversation: the viewer
+    holds a window over the log and pages it in as you travel. Claiming a
+    percentage of the whole would mean counting messages that are not in rows
+    yet — mixing units, and a thumb that jumps every time a page arrives. So
+    the ends say it instead: an `┄` where there is history the window has not
+    reached, and the reader can see that 0 % means «the top of what is here».
+    """
+    rail, thumb_glyph, unloaded = glyphs
+    width = max(width, 1)
+    # AN OFFSET OUTSIDE THE CONVERSATION IS BROUGHT BACK INTO IT HERE. Every
+    # caller runs `Pane.clamp` first, so this cannot be reached today — but
+    # «cannot be reached» is a fact about the callers, checked by reading them,
+    # and it stops being true the first time somebody adds a caller. Without
+    # it a negative offset walks `start` off the front of the list and raises
+    # IndexError, and a large one reports a percentage above 100.
+    offset = min(max(offset, 0), max(total - rows, 0))
+    if total <= 0 or rows <= 0 or total <= rows:
+        # Everything LOADED fits on the screen, so the thumb is the whole rail.
+        # Which is not the same as «this is the whole conversation» — the marks
+        # below still apply, and skipping them here painted a full rail over a
+        # window with five hundred messages behind it.
+        track = [thumb_glyph] * width
+    else:
+        thumb = min(max(round(width * rows / total), 1), width)
+        travel = width - thumb
+        at = offset / max(total - rows, 1)
+        start = min(round(travel * at), travel)
+        track = [rail] * width
+        for i in range(start, start + thumb):
+            track[i] = thumb_glyph
+    # The marks last, so an end that carries one is never painted over by the
+    # thumb sitting on top of it — at the top of a window with more behind it,
+    # which is the exact case they exist for.
+    if more_above:
+        track[0] = unloaded
+    if more_below:
+        track[-1] = unloaded
+    return "".join(track)
+
+
+@dataclass
+class Gutter:
+    """A vertical scrollbar down the right edge of a pane.
+
+    Kept as a record rather than drawn and forgotten for the same reason the
+    bar is: a click has to be resolved against the column and rows that were
+    actually painted, and a handler that works them out for itself a moment
+    later is a handler that eventually disagrees with the screen.
+    """
+
+    x: int
+    top: int
+    rows: int
+    pane: "Pane"
+
+    def holds(self, x: int, y: int) -> bool:
+        return x == self.x and self.top <= y < self.top + self.rows
+
+    def fraction(self, y: int) -> float:
+        return (y - self.top) / max(self.rows - 1, 1)
+
+
 def line_pair(line: str) -> int:
     """Which colour this line asks for. 0 = the speaker's, untouched."""
     if not line.strip():
@@ -959,8 +1088,8 @@ def _w(text: str) -> int:
 
 
 def _pad(text: str, width: int) -> str:
-    """Pad to `columns` COLUMNS. `f"{x:<n}"` counts characters, so
-    con kanji dejaba el border derecho descolocado."""
+    """Pad to `width` COLUMNS. `f"{x:<n}"` counts characters, which left the
+    right-hand border out of line on anything written in kanji."""
     return text + " " * max(0, width - _w(text))
 
 
@@ -1055,7 +1184,7 @@ def _body_lines(env: Envelope, width: int) -> list[str]:
     if env.kind == KIND_HELLO:
         b = env.body
         loc = ", ".join(x for x in (b.get("repo"), b.get("branch")) if x)
-        detail = "se unió" + (f" desde {loc}" if loc else "")
+        detail = "joined" + (f" from {loc}" if loc else "")
         if b.get("focus"):
             detail += f" — {b['focus']}"
         return _wrap(detail, width)
@@ -1068,9 +1197,18 @@ def _body_lines(env: Envelope, width: int) -> list[str]:
         if b.get("action") == "received":
             return _wrap(f"collected {b.get('name')} (deleted from the host)", width)
         size = int(b.get("size") or 0)
-        return _wrap(f"compartido {b.get('name')} ({size / 1024:.0f} KB) · "
+        return _wrap(f"shared {b.get('name')} ({size / 1024:.0f} KB) · "
                      f"collab file get {b.get('id')}", width)
     return _wrap(env.text or str(env.body), width)
+
+
+#: SPELLED OUT RATHER THAN ASKED OF strftime. `%b` is locale-dependent, so the
+#: date beside a message came out in whatever language the machine happened to
+#: be set to — and a transcript two people read together cannot have half its
+#: dates in one language. This is also the only place the month is named, so
+#: `_day_label` and `_stamp` cannot disagree about how to spell it.
+MONTHS = ("jan", "feb", "mar", "apr", "may", "jun",
+          "jul", "aug", "sep", "oct", "nov", "dec")
 
 
 def _day(ts: str) -> str:
@@ -1089,25 +1227,23 @@ def _day_label(ts: str) -> str:
         return "today"
     if delta == 1:
         return "yesterday"
-    return d.strftime("%d %b %Y").lower()
+    return f"{d.day} {MONTHS[d.month - 1]} {d.year}"
 
 
 def _stamp(ts: str) -> str:
-    """«15:22» when it is today, «30 ago 15:22» when it is not.
+    """«15:22» when it is today, «30 aug 15:22» when it is not.
 
     The date only appears when it is needed. Always showing it means six extra
     characters on every message to tell you something you already knew.
     """
-    reloj = local_clock(ts)
+    clock = local_clock(ts)
     try:
         d = _dt.date.fromisoformat(ts[:10])
     except (ValueError, TypeError):
-        return reloj
+        return clock
     if d == _dt.date.today():
-        return reloj
-    meses = ("ene", "feb", "mar", "abr", "may", "jun",
-             "jul", "ago", "sep", "oct", "nov", "dic")
-    return f"{d.day} {meses[d.month - 1]} {reloj}"
+        return clock
+    return f"{d.day} {MONTHS[d.month - 1]} {clock}"
 
 
 def _fold_lines_to(lines: list[str], fold: int, open_now: bool) -> tuple[list[str], int]:
@@ -1151,7 +1287,7 @@ def event_rows(env: Envelope, width: int, me: str,
     clock = local_clock(env.ts)
     pair = _theme_colour(T["header"], speaker)
     border = _theme_colour(T["frame"], speaker)
-    cuerpo_pair = _theme_colour(T["text"], speaker)
+    body_pair = _theme_colour(T["text"], speaker)
     tl, tr, bl, br, h, v = (list(str(T["chars"])) + list("╭╮╰╯─│"))[:6]
 
     # --- system events: one centred line, no bubble -------------------------
@@ -1247,9 +1383,9 @@ def event_rows(env: Envelope, width: int, me: str,
         if is_button:
             tone = C_BUTTON
         elif T["tones"]:
-            tone = line_pair(line) or cuerpo_pair
+            tone = line_pair(line) or body_pair
         else:
-            tone = cuerpo_pair
+            tone = body_pair
         rows.append(Row(left + body, tone,
                         curses.A_BOLD if is_button else 0, seq, bool(is_button),
                         border))
@@ -1294,8 +1430,8 @@ def classic_rows(env: Envelope, width: int, me: str,
     # line's text starts, and body_width was computed too generous by the same
     # amount — so line one was built wider than the pane and the terminal threw
     # away the overflow.
-    ancho_head = _w(head)
-    indent = " " * ancho_head
+    head_width = _w(head)
+    indent = " " * head_width
 
     # AND THE HEADER CAN BE WIDER THAN THE PANE. It is twenty-five columns for
     # any ASCII name, and draw() renders panes from twenty-four: between 24 and
@@ -1306,10 +1442,10 @@ def classic_rows(env: Envelope, width: int, me: str,
     # Under that width the header is dropped to its first line and the body
     # runs full width underneath: unusual-looking, but readable, which is the
     # only thing that matters at twenty-four columns.
-    apretado = ancho_head + 8 > width
-    if apretado:
+    cramped = head_width + 8 > width
+    if cramped:
         indent = ""
-    body_width = max(width - (0 if apretado else ancho_head) - 1, 8)
+    body_width = max(width - (0 if cramped else head_width) - 1, 8)
 
     lines = _body_lines(env, body_width)
     open_now = seq in expanded
@@ -1319,26 +1455,39 @@ def classic_rows(env: Envelope, width: int, me: str,
     text = _theme_colour(T["text"], speaker)
     dim = curses.A_DIM if env.kind in (KIND_PRESENCE, KIND_HELLO) else 0
 
-    def _tono(line: str) -> int:
+    def _tone(line: str) -> int:
         return (line_pair(line) or text) if T["tones"] else text
 
-    primera = shown[0] if shown else ""
-    if apretado:
+    first_line = shown[0] if shown else ""
+    if cramped:
         # The header on its own line, then the text with nothing in front of it.
         rows = [Row(_clip(head, width), pair, dim, seq, False, pair)]
-        if primera:
-            rows.append(Row(_clip(primera, width), _tono(primera), dim, seq,
+        if first_line:
+            rows.append(Row(_clip(first_line, width), _tone(first_line), dim, seq,
                             False, pair))
     else:
-        rows = [Row(head + primera, _tono(primera), dim, seq, False, pair)]
+        rows = [Row(head + first_line, _tone(first_line), dim, seq, False, pair)]
     for extra in shown[1:]:
-        rows.append(Row(indent + extra, _tono(extra), dim, seq, False, pair))
+        rows.append(Row(_clip(indent + extra, width), _tone(extra), dim, seq,
+                        False, pair))
     if hidden:
         plural = "line" if hidden == 1 else "lines"
         label = ("▾ show less" if open_now
                     else f"▸ show more ({hidden} {plural})")
-        rows.append(Row(indent + label, C_BUTTON, curses.A_BOLD, seq, True,
-                        pair))
+        # THE INDENT GIVES WAY, NOT THE LABEL. This row is a control, and the
+        # indent under it is decoration that lines it up with the text above;
+        # `_clip` alone would spend the narrow pane on the alignment and cut
+        # the button down to «▸ show m…», which is neither readable nor
+        # obviously a button.
+        #
+        # It goes wrong only where the header column is wide and the pane is
+        # not: `classic` at 40 columns put a 31-column indent in front of a
+        # 21-column label and returned a row of 52. Nobody met it because the
+        # shipped `classic` has `fold: 0` and never draws this row at all —
+        # until `collab fold` made every theme able to.
+        room = max(width - _w(label), 0)
+        rows.append(Row(_clip(indent[:room] + label, width), C_BUTTON,
+                        curses.A_BOLD, seq, True, pair))
     return rows
 
 
@@ -1414,7 +1563,7 @@ def conversation_rows(events, width: int, me: str,
     # viewer. Read once, changing theme would mean closing it, and whoever
     # tried would think the command does nothing.
     T = _current_theme()
-    fold = int(T["fold"])
+    fold = effective_fold()
     # BY THE LAYOUT IT DECLARES, not by what it is called. With `if theme ==
     # "classic"` any user theme extending classic came out in bubbles: it
     # inherited everything except the one thing that was actually checked.
@@ -1577,6 +1726,18 @@ class Tui:
         #: wheel tell the panes apart.
         self._chat_top = 0
         self._chat_rows: list[Row] = []
+        #: Where the way back to the live end was drawn on the bottom row, as
+        #: a half-open column span, and the row it was drawn on. Recorded by
+        #: the draw rather than worked out again by the click handler: a
+        #: handler that re-derives a control's position by searching the line
+        #: for a bracket is a handler that breaks the day somebody's status
+        #: command prints one.
+        self._jump: tuple[int, int] = (0, 0)
+        self._jump_y = -1
+        #: The vertical scrollbars painted this frame, if any. Empty is the
+        #: ordinary case: a pane whose content fits does not get one, and does
+        #: not lose the column either.
+        self._gutters: list[Gutter] = []
         #: The theme the rows on screen were built with, so a change can be
         #: noticed and the reader's place kept across it.
         self._theme_drawn: str = ""
@@ -1741,6 +1902,9 @@ class Tui:
 
     def _draw(self, win) -> None:
         win.erase()
+        # Forgotten with the frame they belong to: a gutter left behind from a
+        # pane that no longer has one is a click target over live text.
+        self._gutters = []
         # ASKED ONCE PER FRAME, from the config, so a change made in another
         # terminal reaches a pane that is already open — the same live reload
         # `theme` has. `load_config` re-reads only when the file's mtime or
@@ -1825,7 +1989,6 @@ class Tui:
         # all, and a pane you cannot see is a pane you cannot scroll.
         roster_h = min(roster_h, max(body_height - 4, 2))
 
-        rows = self._roster(width - 1)
         # THE ROW IS TAKEN ONLY WHEN IT IS USED, and only where a whole
         # participant still fits after it. Reserved unconditionally, a session
         # with nothing to say — no batch, nothing said yet, nobody fetched yet
@@ -1835,6 +1998,13 @@ class Tui:
         session = self._roster_bar() if self._roster_settings["enabled"] else []
         session_h = 1 if session and roster_h - 2 >= 2 else 0
         self.roster.rows = roster_h - 1 - session_h
+        # AND THE HEIGHT IS SETTLED BEFORE THE WIDTH IS ASKED FOR, because
+        # `_gutter_width` reads `rows` to decide whether there is anything to
+        # scroll. The gutter then costs the content a column, so the rows are
+        # BUILT to the width that is left rather than trimmed to it afterwards:
+        # trimming would cut the last character off a line that was made to fit.
+        roster_gutter = self._gutter_width(self.roster)
+        rows = self._roster(width - 1 - roster_gutter * 2)
         self.roster.total = len(rows)
         self.roster.settle()
         hidden = max(len(rows) - self.roster.rows - self.roster.offset, 0)
@@ -1855,7 +2025,11 @@ class Tui:
             # and painting them here by hand meant that colour was computed and
             # then thrown away — the split view showed none of it while the
             # roster-only view did.
-            self._paint_row(win, body_top + 1 + i, rows[idx], width - 1)
+            self._paint_row(win, body_top + 1 + i, rows[idx],
+                            width - 1 - roster_gutter * 2)
+        if roster_gutter:
+            self._paint_gutter(win, width - 2, body_top + 1, self.roster.rows,
+                               self.roster)
 
         chat_top = body_top + roster_h
         if session_h:
@@ -1873,12 +2047,20 @@ class Tui:
         # WHERE WE WERE, IN MESSAGES, BEFORE THE ROWS ARE REBUILT. Taken from
         # the rows that are on screen right now, because after the rebuild the
         # offset may point at a different message entirely.
-        antes = self.chat.top_seq(self._chat_rows) if self._chat_rows else 0
-        tema_antes = self._theme_drawn
+        was_at = self.chat.top_seq(self._chat_rows) if self._chat_rows else 0
+        theme_before = self._theme_drawn
 
-        chat_rows = self._conversation(width - 1)
-        self._chat_top = chat_top + 1
+        # ONE FOOT ROW, AND IT IS THE STATUS BAR'S. This branch used to draw a
+        # scrollbar of its own down there and reserved the row unconditionally;
+        # the status row got there first and says more, so the conversation's
+        # height is its arithmetic and the position is told down the side
+        # instead. `rows` is set before the gutter is measured because
+        # `_gutter_width` reads it — what comes from the previous frame is
+        # `total`, set below.
         self.chat.rows = height - chat_top - 1 - foot
+        chat_gutter = self._gutter_width(self.chat)
+        chat_rows = self._conversation(width - 1 - chat_gutter * 2)
+        self._chat_top = chat_top + 1
         self.chat.total = len(chat_rows)
         self.chat.settle()
 
@@ -1886,17 +2068,67 @@ class Tui:
         # under your eyes instead of leaving the offset pointing at whatever
         # now happens to live at that row number.
         self._theme_drawn = theme()
-        if tema_antes and self._theme_drawn != tema_antes:
-            self.chat.hold(antes, chat_rows)
+        if theme_before and self._theme_drawn != theme_before:
+            self.chat.hold(was_at, chat_rows)
         for i in range(self.chat.rows):
             idx = self.chat.offset + i
             if idx >= len(chat_rows):
                 break
-            self._paint_row(win, chat_top + 1 + i, chat_rows[idx], width - 1)
+            self._paint_row(win, chat_top + 1 + i, chat_rows[idx],
+                            width - 1 - chat_gutter * 2)
+        if chat_gutter:
+            self._paint_gutter(win, width - 2, chat_top + 1, self.chat.rows,
+                               self.chat, more_above=m.more_above(),
+                               more_below=bool(m.pending()))
 
         # --- help ----------------------------------------------------------
         self._hint(win, height, width)
         win.refresh()
+
+    def _gutter_width(self, pane: "Pane") -> int:
+        """One column, or none — by what the theme asks for.
+
+        Decided from the row count the LAST frame arrived at. Deciding it from
+        this frame's would mean laying the conversation out twice at two
+        widths, once to ask the question and once to answer it — and the layout
+        is cached per width, so the two would evict each other on every frame
+        and the cache would stop existing.
+
+        The one-frame lag cannot oscillate: taking a column away only ever
+        makes text wrap into MORE rows, never fewer, so a pane that needs the
+        bar still needs it once it has it.
+
+        A PANE WITH NO HEIGHT GETS NOTHING, WHATEVER THE SETTING SAYS. `always`
+        is a preference about a pane you can see; before the first frame there
+        is none to draw beside, and honouring it there would put a bar on every
+        pane in the window for one frame.
+        """
+        if pane.rows <= 0:
+            return 0
+        mode = _current_theme()["scrollbar_side"]
+        if mode == "off":
+            return 0
+        if mode == "always":
+            return 1
+        return 1 if pane.total > pane.rows else 0
+
+    def _paint_gutter(self, win, x: int, top: int, rows: int, pane: "Pane", *,
+                      more_above: bool = False,
+                      more_below: bool = False) -> None:
+        """Paint the vertical scrollbar and remember where it went."""
+        if rows <= 0:
+            return
+        cells = scroll_track(rows, pane.offset, pane.rows, pane.total,
+                             more_above=more_above, more_below=more_below,
+                             glyphs=(V_RAIL, V_THUMB, V_UNLOADED))
+        for i, cell in enumerate(cells):
+            tone = C_DIM if cell == V_RAIL else C_ACCENT
+            attr = curses.A_DIM if cell == V_RAIL else curses.A_BOLD
+            try:
+                win.addnstr(top + i, x, cell, 1, curses.color_pair(tone) | attr)
+            except curses.error:
+                pass
+        self._gutters.append(Gutter(x=x, top=top, rows=rows, pane=pane))
 
     def _hint(self, win, height: int, width: int,
               keys: tuple[str, str] = (CHAT_KEYS, CHAT_KEYS_SHORT),
@@ -1950,7 +2182,25 @@ class Tui:
                                       stats=self.model.own_stats,
                                       command=self._command.text(),
                                       segments=self._settings["segments"])
-        self._paint_bar(win, height - 1, width, parts, behind=behind)
+        line = self._paint_bar(win, height - 1, width, parts, behind=behind)
+        # THE NOTICE IS THE WAY BACK, so a click on it is too. It already says
+        # what the click would do — «End (or G) jumps to the newest» — and it
+        # is the one part of this row that is news rather than a reminder, so
+        # it needs no bracket around it to earn a hand: the alternative was
+        # three more columns saying a second time what the sentence says once.
+        #
+        # MEASURED FROM THE LINE THAT WAS DRAWN, not from `what`. `fit` puts
+        # the notice first and never drops it, but it will CLIP it when the row
+        # cannot hold it, and a span taken from the unclipped text would then
+        # reach past the end of the row and answer clicks that landed on
+        # nothing.
+        #
+        # AND NEVER ON THE ROSTER'S ROW. That one is drawn by this same method
+        # with `roster=True`, over a pane with no conversation in it: there is
+        # nowhere to jump to, so it claims no row and the click stays a no-op.
+        self._jump_y = -1 if roster else height - 1
+        self._jump = ((0, min(_w(what), _w(line)))
+                      if what and not roster else (0, 0))
 
     def _roster_bar(self, keys: Any = "") -> list[Any]:
         """The roster panel's row: what is true for EVERY participant, or nothing.
@@ -1983,7 +2233,7 @@ class Tui:
             segments=self._roster_settings["segments"])
 
     def _paint_bar(self, win, y: int, width: int, parts: list[Any], *,
-                   behind: int = 0) -> None:
+                   behind: int = 0) -> str:
         """Fit a composed row to the pane and put it on the screen.
 
         One painter for both rows, so the column arithmetic is written once and
@@ -1992,10 +2242,15 @@ class Tui:
         bar, a `⏸`, a `→` and whatever a user's command printed, and cutting
         CHARACTERS to fit COLUMNS is only ever right for ASCII. A write past
         the last cell of a pane is what ends the viewer rather than the frame.
+
+        RETURNS THE LINE IT DREW, so a caller with a control on the row can
+        measure its span from what actually reached the screen rather than from
+        what it hoped would fit. `fit` narrows and clips; a span taken from the
+        text before that answers clicks that landed on empty terminal.
         """
         room = max(width - 1, 0)
         if not room:
-            return
+            return ""
         line = statusbar.fit(parts, room, _w, _clip)
         attr = (curses.color_pair(C_ACCENT) | curses.A_BOLD if behind
                 else curses.color_pair(C_DIM) | curses.A_DIM)
@@ -2003,6 +2258,7 @@ class Tui:
             win.addnstr(y, 0, line, room, attr)
         except curses.error:
             pass
+        return line
 
     def _roster_label(self, people: list) -> str:
         """Say when this is a memory rather than an observation.
@@ -2071,9 +2327,17 @@ class Tui:
         return "roster"
 
     def handle_mouse(self) -> bool:
-        """One wheel notch. Silent when the terminal reports no mouse."""
+        """One wheel notch, or a click on a «show more» button.
+
+        BOTH, and in one place: the wheel and the click arrive as the same
+        KEY_MOUSE, and `getmouse` hands out an event once — a second handler
+        reading it after this one gets nothing. Splitting them cost the button
+        its click, because whichever branch ran first answered for the other.
+
+        Silent when the terminal reports no mouse.
+        """
         try:
-            _, _, y, _, state = curses.getmouse()
+            _, x, y, _, state = curses.getmouse()
         except curses.error:
             return True
         where = self.pane_at(y)
@@ -2092,6 +2356,15 @@ class Tui:
         elif down:
             pane.scroll(WHEEL_LINES)
         else:
+            # Not the wheel, so a button. Two things on screen answer a click:
+            # the bottom bar, and a «show more» in the conversation. Anywhere
+            # else it does nothing — the mouse must not move the focus or
+            # select by accident while somebody is reading.
+            if state & _CLICK:
+                if y == self._jump_y:
+                    self._bar_click(x)
+                elif not self._gutter_click(x, y):
+                    self._fold_at(y, where)
             return True
         # Scrolling a pane is also a statement about which one you care about.
         if self.view == "both":
@@ -2117,9 +2390,6 @@ class Tui:
         # replies — so quitting on it makes the view close itself at random.
         if key in (ord("q"), ord("Q")):
             return False
-        if key == curses.KEY_MOUSE:
-            self._mouse()
-            return True
         if key == ord("\t"):
             self.focus = "roster" if self.focus == "chat" else "chat"
         elif key in (curses.KEY_UP, ord("k")):
@@ -2136,14 +2406,9 @@ class Tui:
         # hold ↓ through the history you had just scrolled past.
         elif key in (ord("G"), curses.KEY_END, curses.KEY_LL):
             if pane is self.chat:
-                # The end means what is being said NOW, not the end of the
-                # window: a reader who scrolled away an hour ago is fifty
-                # messages behind it, and walking there a page at a time is
-                # exactly the thing this key exists to avoid.
-                self.model.load_tail()
-                self._chat_rows = self._conversation(self._chat_width or 80)
-                self.chat.total = len(self._chat_rows)
-            pane.to_end()
+                self.jump_to_newest()
+            else:
+                pane.to_end()
         elif key in (ord("g"), curses.KEY_HOME, curses.KEY_FIND):
             if pane is self.chat:
                 # And the top means the top of the CONVERSATION, not the top of
@@ -2175,24 +2440,77 @@ class Tui:
             self.reach_forward()
         return True
 
-    def _mouse(self) -> None:
-        """Wheel and click over the conversation.
+    def jump_to_newest(self) -> None:
+        """Back to what is being said NOW, not to the end of the window.
 
-        A click on the button row folds or unfolds THAT message. In
-        cualquier otra row no hace nada: el raton no debe mover el foco ni
-        seleccionar por accidente mientras se lee.
+        A reader who scrolled away an hour ago is fifty messages behind the
+        live end, and walking there a page at a time is the exact thing this
+        exists to avoid. One implementation because two ways to ask for it —
+        the End key and the button on the bar — must not be able to disagree
+        about what «the newest» means.
         """
-        try:
-            _id, _x, y, _z, state = curses.getmouse()
-        except curses.error:
-            return
-        if state & curses.BUTTON4_PRESSED:
-            self.chat.scroll(-3)
-            return
-        if state & getattr(curses, "BUTTON5_PRESSED", 0):
-            self.chat.scroll(3)
-            return
-        if not (state & (curses.BUTTON1_CLICKED | curses.BUTTON1_PRESSED)):
+        self.model.load_tail()
+        self._chat_rows = self._conversation(self._chat_width or 80)
+        self.chat.total = len(self._chat_rows)
+        self.chat.to_end()
+
+    def seek(self, fraction: float, pane: "Pane | None" = None) -> None:
+        """Put the reader that far down the loaded rows of a pane.
+
+        What a click on a scrollbar means, on either axis. It travels the
+        LOADED window and does not page: the rail is what it is pointing at,
+        and a click that also pulled a page in would land somewhere other than
+        where it was aimed.
+        """
+        pane = pane if pane is not None else self.chat
+        limit = max(pane.total - pane.rows, 0)
+        pane.follow = False
+        pane.offset = int(round(max(0.0, min(fraction, 1.0)) * limit))
+        pane.clamp()
+        if pane.offset >= limit:
+            # The roster does not follow anything, and saying it does would
+            # make it jump to the newest arrival under whoever is reading it.
+            pane.follow = pane is self.chat
+
+    def _gutter_click(self, x: int, y: int) -> bool:
+        """A click on a vertical scrollbar. False when it landed on neither."""
+        for gutter in self._gutters:
+            if gutter.holds(x, y):
+                self.seek(gutter.fraction(y), gutter.pane)
+                if self.view == "both":
+                    # Scrolling a pane is a statement about which one you care
+                    # about, and so is aiming at its scrollbar.
+                    self.focus = "roster" if gutter.pane is self.roster else "chat"
+                return True
+        return False
+
+    def _bar_click(self, x: int) -> bool:
+        """A click on the bottom row. False when it landed on nothing.
+
+        Nothing is the ordinary case — most of that row is a batch figure, a
+        spend and a reminder of which keys exist — and it stays a no-op rather
+        than being rounded to the nearest control. The one thing there that
+        answers is the way back to the live end.
+
+        RESOLVED AGAINST THE SPAN THE DRAW RECORDED, and only while the notice
+        is actually on the row. Following the live end there is nothing to go
+        back to, `_jump` is `(0, 0)`, and a click anywhere on the row does
+        nothing at all.
+        """
+        start, end = self._jump
+        if end > start and start <= x < end:
+            self.jump_to_newest()
+            return True
+        return False
+
+    def _fold_at(self, y: int, where: str) -> None:
+        """Fold or unfold the message whose button row is at screen row ``y``.
+
+        Anywhere else it does nothing — and «anywhere else» includes the roster
+        and the title bar: the row is counted DOWN from the top of the
+        conversation, so a click above it still lands on a row by arithmetic.
+        """
+        if where != "chat" or y < self._chat_top:
             return
         idx = self.chat.offset + (y - self._chat_top)
         if not (0 <= idx < len(self._chat_rows)):
@@ -2211,12 +2529,16 @@ class Tui:
         """One half, filling the window. tmux owns the split in this mode."""
         m = self.model
         people = m.participants()
+        pane = self.roster if self.view == "roster" else self.chat
+        pane.rows = height - 2
+        gutter = self._gutter_width(pane)
+        content = width - 1 - gutter * 2
         if self.view == "roster":
-            rows = self._roster(width - 1)
-            pane, label = self.roster, self._roster_label(people)
+            rows = self._roster(content)
+            label = self._roster_label(people)
         else:
-            rows = self._conversation(width - 1)
-            pane, label = self.chat, self._chat_label()
+            rows = self._conversation(content)
+            label = self._chat_label()
             self._chat_top = 1
 
         state = m.state()
@@ -2238,7 +2560,12 @@ class Tui:
             idx = pane.offset + i
             if idx >= len(rows):
                 break
-            self._paint_row(win, 1 + i, rows[idx], width - 1)
+            self._paint_row(win, 1 + i, rows[idx], content)
+        if gutter:
+            self._paint_gutter(
+                win, width - 2, 1, pane.rows, pane,
+                more_above=pane is self.chat and m.more_above(),
+                more_below=pane is self.chat and bool(m.pending()))
 
         if self.view == "roster":
             # Its own keys, and no scrolled-back notice: the roster does not
@@ -2257,6 +2584,19 @@ class Tui:
             self._hint(win, height, width)
 
 
+def _pair_or(pair: int, colour: int, fallback: int) -> None:
+    """`colour` on the default ground, or `fallback` where it does not exist.
+
+    A hex colour resolves to an index out of the 256, and an eight-colour
+    terminal has no such index — asking for it raises and would take the whole
+    viewer down over a shade of blue.
+    """
+    try:
+        curses.init_pair(pair, colour, -1)
+    except (curses.error, ValueError):
+        curses.init_pair(pair, fallback, -1)
+
+
 def _init_colors() -> None:
     curses.start_color()
     curses.use_default_colors()
@@ -2269,7 +2609,7 @@ def _init_colors() -> None:
     curses.init_pair(C_GOOD, curses.COLOR_GREEN, -1)
     curses.init_pair(C_BAD, curses.COLOR_RED, -1)
     curses.init_pair(C_WARNLINE, curses.COLOR_YELLOW, -1)
-    curses.init_pair(C_INFO, curses.COLOR_BLUE, -1)
+    _pair_or(C_INFO, _colour_index(INFO_HEX), curses.COLOR_BLUE)
     curses.init_pair(C_TEXT, curses.COLOR_WHITE, -1)
     curses.init_pair(C_BUTTON, curses.COLOR_YELLOW, -1)
     _deal_colours(curses.COLORS)
@@ -2277,7 +2617,10 @@ def _init_colors() -> None:
         curses.init_pair(C_SPEAKER_BASE + i, colour, -1)
 
 
-def run(profile: SessionProfile, view: str = "both", limit: int = OPEN_WITH) -> int:
+def run(profile: SessionProfile, view: str = "both", limit: int = OPEN_WITH,
+        model: "Model | None" = None) -> int:
+    """The viewer. ``model`` is for the simulated session: hand one in and the
+    conversation comes from there instead of from this machine's log."""
     # MI PROPIO COLOR, DE LA CONFIG LOCAL, ANTES DE MIRAR EL ROSTER.
     #
     # Chosen colours arrive through the roster, which comes from the hub. Mine
@@ -2291,7 +2634,7 @@ def run(profile: SessionProfile, view: str = "both", limit: int = OPEN_WITH) -> 
     if mine not in (None, ""):
         record_colours([{"name": n, "color": mine}
                           for n in my_names(profile.name)])
-    model = Model(profile=profile)
+    model = model if model is not None else Model(profile=profile)
     model.load_initial(limit=limit)
     tui = Tui(model, view=view)
 

@@ -222,7 +222,7 @@ def test_an_offline_person_first_does_not_break_the_roster(monkeypatch):
 # --- curses pairs are a finite resource -------------------------------------
 
 def test_the_same_colour_is_not_allocated_twice(monkeypatch):
-    """Kills: `if color not in _PARES_LIBRES` → `if True`.
+    """Kills: `if color not in _PAIRS_BY_COLOUR` → `if True`.
 
     Without the cache a fresh curses pair is allocated on every redraw, and a
     terminal runs out within seconds of a live session. It fails slowly, which
@@ -232,7 +232,7 @@ def test_the_same_colour_is_not_allocated_twice(monkeypatch):
     monkeypatch.setattr(tui.curses, "init_pair",
                         lambda *a: calls.append(a) or None)
     monkeypatch.setattr(tui, "_colour_index", lambda v: 123)
-    tui._PARES_LIBRES.pop(123, None)
+    tui._PAIRS_BY_COLOUR.pop(123, None)
     for _ in range(20):
         tui._pair_for("#123456")
     assert len(calls) == 1, f"allocated {len(calls)} pairs for one colour"
