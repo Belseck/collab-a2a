@@ -442,7 +442,7 @@ def set_stats_source(command: str | None = None,
 
 #: The levels of the xterm-256 6x6x6 cube. They are not linear —they jump from
 #: 0 to 95— so the closest 256-colour to a hex has to be searched for, not
-#: dividiendo entre 51.
+#: arrived at by dividing by 51.
 _LEVELS = (0, 95, 135, 175, 215, 255)
 
 

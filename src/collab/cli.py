@@ -1662,6 +1662,20 @@ def cmd_discover(args: argparse.Namespace) -> int:
     return 0
 
 
+def _view_for(layout: str, view: str) -> str:
+    """Which half of the viewer a layout asks for.
+
+    In one place because two callers decide it — the real session and the
+    simulated one — and a `--layout chat` that showed the roster in the demo
+    would be a difference between them that nothing would catch.
+    """
+    if layout == "chat":
+        return "chat"
+    if layout == "roster":
+        return "roster"
+    return view
+
+
 def cmd_watch(args: argparse.Namespace) -> int:
     """A readable live transcript, for a person to leave open in a pane."""
     from .client import watch as w
@@ -1681,6 +1695,30 @@ def cmd_watch(args: argparse.Namespace) -> int:
            f"{saved['roster_position']}")
         if SessionProfile.current() is None:
             print(dim("       it will be used the next time you watch a session"))
+            return 0
+
+    # THE SIMULATED SESSION, BEFORE ANYTHING LOOKS FOR A REAL ONE. Themes,
+    # folding, the scrollbar and the colours are judged by eye, and judging
+    # them used to mean finding a second agent and hoping they said something
+    # long enough to fold. Nothing here touches the network or the disk.
+    if getattr(args, "demo", False):
+        from . import demo as demo_session
+
+        if not sys.stdout.isatty():
+            fail("--demo needs a terminal: it opens the full-screen viewer")
+            return 1
+        from .client import tui
+
+        tui.ROSTER_SHARE = max(5, min(roster_size, 90)) / 100
+        # `--layout tmux` splits a real session across two panes, each rejoining
+        # by id. There is no session to rejoin here, so it reads as the built-in
+        # split — which is the same two panes, in one window.
+        view = _view_for("split" if layout == "tmux" else layout, args.view)
+        opening = tui.OPEN_WITH if args.limit is None else max(args.limit, 0)
+        try:
+            return tui.run(demo_session.profile(), view=view, limit=opening,
+                           model=demo_session.model())
+        except KeyboardInterrupt:
             return 0
 
     profile = _require_profile(args)
@@ -1737,11 +1775,7 @@ def cmd_watch(args: argparse.Namespace) -> int:
             else:
                 args.view = "chat"
 
-    view = args.view
-    if layout == "chat":
-        view = "chat"
-    elif layout == "roster":
-        view = "roster"
+    view = _view_for(layout, args.view)
 
     if not plain:
         from .client import tui
@@ -2590,7 +2624,7 @@ def cmd_theme(args: argparse.Namespace) -> int:
     from . import themes as _themes
 
     if getattr(args, "new", None):
-        return _create_theme(args.new, getattr(args, "desde", None))
+        return _create_theme(args.new, getattr(args, "from_theme", None))
 
     if getattr(args, "check", False):
         return _check_themes()
@@ -2662,7 +2696,7 @@ def _check_themes() -> int:
     return 1
 
 
-def _create_theme(name: str, desde: str | None = None) -> int:
+def _create_theme(name: str, from_theme: str | None = None) -> int:
     """Write a new .md, ready to edit and already working.
 
     The template carries a theme you can see rather than an empty file: you put
@@ -2677,33 +2711,33 @@ def _create_theme(name: str, desde: str | None = None) -> int:
         return 2
 
     folder = _themes.user_themes_dir()
-    destino = folder / f"{cleaned}.md"
-    if destino.exists():
+    target = folder / f"{cleaned}.md"
+    if target.exists():
         # NEVER overwritten without being asked: a theme somebody has spent
         # weeks tuning cannot be lost to a repeated command.
-        fail(f"{destino} already exists")
+        fail(f"{target} already exists")
         print(dim("  edit that one, or pick another name"))
         return 2
 
     # IT STARTS FROM A THEME THAT EXISTS — the one asked for, or the one you
     # have on. Starting from the values you are looking at right now is far more
     # use than starting from defaults you have never seen.
-    base_nombre = (desde or theme()).strip().lower()
-    if base_nombre not in _themes.all_themes():
-        fail(f"no theme called {base_nombre!r} to start from")
+    base_name = (from_theme or theme()).strip().lower()
+    if base_name not in _themes.all_themes():
+        fail(f"no theme called {base_name!r} to start from")
         print("  available: " + " · ".join(theme_names()))
         return 2
-    base = _themes.resolve(base_nombre)
+    base = _themes.resolve(base_name)
 
     try:
         folder.mkdir(parents=True, exist_ok=True)
-        destino.write_text(_themes.template(cleaned, base), encoding="utf-8")
+        target.write_text(_themes.template(cleaned, base), encoding="utf-8")
     except OSError as exc:
-        fail(f"cannot write {destino} ({exc})")
+        fail(f"cannot write {target} ({exc})")
         return 1
 
-    ok(f"created {c(str(destino), '36')}")
-    print(dim(f"  a copy of {base_nombre}, with every setting written out"))
+    ok(f"created {c(str(target), '36')}")
+    print(dim(f"  a copy of {base_name}, with every setting written out"))
     print(dim(f"  edit it, then try it with:  collab theme {cleaned}"))
     return 0
 
@@ -3646,6 +3680,9 @@ def build_parser() -> argparse.ArgumentParser:
                     help="where the roster pane goes in the tmux layout")
     wa.add_argument("--save", action="store_true",
                     help="remember these layout choices as your default")
+    wa.add_argument("--demo", action="store_true",
+                    help="open the viewer on a simulated conversation, with no "
+                         "session and nothing on the network")
     add_session_flag(wa)
     wa.set_defaults(func=cmd_watch)
 
@@ -3687,7 +3724,7 @@ def build_parser() -> argparse.ArgumentParser:
                     help="list the themes in your themes folder")
     th.add_argument("-n", "--new", metavar="NAME",
                     help="write a new theme file you can edit")
-    th.add_argument("--from", dest="desde", metavar="THEME",
+    th.add_argument("--from", dest="from_theme", metavar="THEME",
                     help="start the new file from this theme instead of the "
                          "one you have on")
     th.add_argument("--check", action="store_true",
