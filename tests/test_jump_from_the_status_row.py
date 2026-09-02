@@ -128,6 +128,25 @@ def test_scrolled_back_with_nothing_new_is_still_a_way_back():
     assert end > start
 
 
+def test_the_rosters_own_row_claims_no_click():
+    """The same method draws the roster panel's row, over a pane with no
+    conversation in it. There is nowhere to jump to from there, so it must
+    claim neither a span nor a row — otherwise a click at the foot of a
+    roster-only viewer would scroll a conversation nobody is looking at."""
+    viewer, _ = tui.Tui(FakeModel(newer=2), view="roster"), None
+    win = _Pane(30, 110)
+    viewer.chat.rows, viewer.chat.total, viewer.chat.offset = 10, 200, 20
+    viewer.chat.follow = False
+    viewer._chat_rows = [Row(f"line {i}", seq=i + 1) for i in range(200)]
+    viewer._settings = config.watch_status_settings()
+    viewer._roster_settings = config.watch_roster_settings()
+    viewer._bar = True
+    viewer._hint(win, 30, 110, notice=False, roster=True)
+
+    assert viewer._jump == (0, 0)
+    assert viewer._jump_y == -1, "no row is claimed, so no click resolves to it"
+
+
 # --- what clicking it does ---------------------------------------------------
 
 def test_clicking_the_notice_goes_to_the_live_end(monkeypatch):
