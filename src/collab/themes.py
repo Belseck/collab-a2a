@@ -23,9 +23,9 @@ learn first.
      `fold: six` has to hear about it rather than get a folding they never asked
      for.
 
-  4. A THEME ONLY CHANGES APPEARANCE. The sixteen settings in KEYS and nothing
+  4. A THEME ONLY CHANGES APPEARANCE. The fifteen settings in KEYS and nothing
      else: colours, widths, sides, frame strokes, grouping, folding, and whether
-     the scrollbars are drawn. There is no
+     the scrollbar is drawn. There is no
      setting that changes what collab DOES, and one cannot be added by writing
      it in the file — anything not on the list is dropped with a warning.
 
@@ -79,7 +79,6 @@ KEYS: dict[str, str] = {
     "chars": "the six strokes of the frame: ╭ ╮ ╰ ╯ ─ │",
     "scrollbar_side": "the column down a pane: always | auto (when there is"
                       " somewhere to go) | off",
-    "scrollbar_bottom": "the rail on the bottom line: always | auto | off",
 }
 
 #: The type each setting has to be, and its range where there is one. Without
@@ -102,7 +101,6 @@ TYPES: dict[str, tuple] = {
     "tones": ("bool", None),
     "chars": ("chars", None),
     "scrollbar_side": ("choice", ("always", "auto", "off")),
-    "scrollbar_bottom": ("choice", ("always", "auto", "off")),
 }
 
 
@@ -200,12 +198,11 @@ DEFAULTS: dict[str, Any] = {
     "narrow_at": 56, "frame": "$SPEAKER", "header": "$SPEAKER",
     "text": "$TEXT", "own_side": "right", "group_by_author": True,
     "day_separators": True, "tones": True, "chars": "╭╮╰╯─│",
-    # THE DEFAULTS ARE THE BEHAVIOUR THAT WAS ALREADY THERE, under a name.
-    # `auto` at the side because a column is width taken from the text, and
-    # spending it to say «there is nowhere to go» is the tmux mistake this
-    # scrollbar exists to avoid. `always` at the bottom because that line is
-    # already spent: the rail costs nothing there that the key names would not.
-    "scrollbar_side": "auto", "scrollbar_bottom": "always",
+    # THE DEFAULT IS THE BEHAVIOUR THAT WAS ALREADY THERE, under a name:
+    # `auto`, because a column is width taken from the text and spending it to
+    # say «there is nowhere to go» is the tmux mistake this scrollbar exists to
+    # avoid.
+    "scrollbar_side": "auto",
 }
 
 

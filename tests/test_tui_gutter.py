@@ -44,12 +44,15 @@ def test_the_column_uses_the_vertical_strokes():
     assert cells.startswith(V_THUMB), "at the top"
 
 
-def test_it_is_the_same_arithmetic_as_the_bottom_bar():
-    """One implementation, two axes. A second copy of this is a second place
-    for the thumb to end up somewhere the reader is not."""
-    across = scroll_track(20, offset=40, rows=10, total=100)
-    down = scroll_track(20, offset=40, rows=10, total=100,
-                        glyphs=(V_RAIL, V_THUMB, V_UNLOADED))
+def test_the_arithmetic_does_not_care_which_way_it_is_drawn():
+    """The strokes are an argument, not a branch. There is only one axis drawn
+    today — the bottom row belongs to the status bar — but the glyphs stayed a
+    parameter, and this says the maths underneath them is the same cells
+    whatever they are. A second copy of it would be a second place for the
+    thumb to end up somewhere the reader is not."""
+    down = scroll_track(20, offset=40, rows=10, total=100)
+    across = scroll_track(20, offset=40, rows=10, total=100,
+                          glyphs=("━", "█", "┄"))
     assert [c != V_RAIL for c in down] == [c != "━" for c in across]
 
 
@@ -76,8 +79,8 @@ def test_an_unmeasured_pane_gets_none():
 
 
 def test_off_takes_the_column_from_a_pane_that_would_have_one(monkeypatch):
-    """The reader is allowed not to want it. Nothing else moves: every key
-    that scrolls still scrolls, and the bottom bar is a separate decision."""
+    """The reader is allowed not to want it, and nothing else moves: every key
+    that scrolls still scrolls, and the status row says what it always said."""
     tui = _tui()
     tui.roster.rows, tui.roster.total = 6, 40
     _theme(monkeypatch, scrollbar_side="off")
@@ -147,7 +150,7 @@ def _with_gutters(chat_top=14):
     tui._chat_rows = [Row(f"line {i}", seq=i + 1) for i in range(200)]
     tui._gutters = [Gutter(x=79, top=3, rows=6, pane=tui.roster),
                     Gutter(x=79, top=chat_top, rows=20, pane=tui.chat)]
-    tui._bar_y = 39
+    tui._jump_y = 39
     return tui
 
 

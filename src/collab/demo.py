@@ -245,32 +245,66 @@ class DemoInbox:
     def __init__(self, script: list[Envelope] | None = None) -> None:
         self.events = script if script is not None else events()
 
-    def _at(self, seq: int) -> int:
-        """Where a seq sits in the log. Past the end when it is not there."""
-        for i, e in enumerate(self.events):
+    def _at(self, seq: int, events: list[Envelope] | None = None) -> int:
+        """Where a seq sits in the log. Past the end when it is not there.
+
+        Asked against the SAME list the caller is about to page over, not
+        always the whole log: with kinds excluded the two have different
+        lengths, and an index into one used to slice the other walks off by
+        however many hidden events happened to be above it.
+        """
+        events = self.events if events is None else events
+        for i, e in enumerate(events):
             if int(e.seq or 0) == seq:
                 return i
-        return len(self.events)
+        return len(events)
 
-    def all_events(self, limit: int = 100) -> list[Envelope]:
-        return list(self.events[-limit:]) if limit else list(self.events)
+    def _shown(self, exclude: tuple[str, ...]) -> list[Envelope]:
+        """The log as the caller is going to draw it.
 
-    def first(self, limit: int = 50) -> list[Envelope]:
-        return list(self.events[:limit])
+        EXCLUDED BEFORE ANYTHING IS COUNTED OR SLICED, which is the same rule
+        `Inbox._without` states for the real reader and states the reason for:
+        dropping the kinds afterwards gives a page shorter than the limit asked
+        for and a count of events that will never reach the screen — a pane
+        saying «3 new below» and then showing nothing when you press End.
 
-    def before(self, seq: int, limit: int = 200) -> list[Envelope]:
-        i = self._at(seq)
-        return list(self.events[max(i - limit, 0):i])
+        The demo has to keep that rule rather than merely accept the argument.
+        Its whole purpose is to run the shipped Model over a log in memory, and
+        a stand-in that answers the same questions differently is a stand-in
+        that hides the bug it exists to expose.
+        """
+        if not exclude:
+            return self.events
+        return [e for e in self.events if e.kind not in exclude]
 
-    def after(self, seq: int, limit: int = 200) -> list[Envelope]:
-        i = self._at(seq)
-        return list(self.events[i + 1:i + 1 + limit])
+    def all_events(self, limit: int = 100, *,
+                   exclude: tuple[str, ...] = ()) -> list[Envelope]:
+        events = self._shown(exclude)
+        return list(events[-limit:]) if limit else list(events)
 
-    def count_after(self, seq: int) -> int:
-        return max(len(self.events) - self._at(seq) - 1, 0)
+    def first(self, limit: int = 50, *,
+              exclude: tuple[str, ...] = ()) -> list[Envelope]:
+        return list(self._shown(exclude)[:limit])
 
-    def has_before(self, seq: int) -> bool:
-        return self._at(seq) > 0
+    def before(self, seq: int, limit: int = 200, *,
+               exclude: tuple[str, ...] = ()) -> list[Envelope]:
+        events = self._shown(exclude)
+        i = self._at(seq, events)
+        return list(events[max(i - limit, 0):i])
+
+    def after(self, seq: int, limit: int = 200, *,
+              exclude: tuple[str, ...] = ()) -> list[Envelope]:
+        events = self._shown(exclude)
+        i = self._at(seq, events)
+        return list(events[i + 1:i + 1 + limit])
+
+    def count_after(self, seq: int, *, exclude: tuple[str, ...] = ()) -> int:
+        events = self._shown(exclude)
+        return max(len(events) - self._at(seq, events) - 1, 0)
+
+    def has_before(self, seq: int, *, exclude: tuple[str, ...] = ()) -> bool:
+        events = self._shown(exclude)
+        return self._at(seq, events) > 0
 
     def close(self) -> None:
         """Nothing to close. Here because the viewer closes what it opens."""

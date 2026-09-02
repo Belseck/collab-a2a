@@ -32,6 +32,7 @@ from ..config import SessionProfile
 from ..protocol import (
     Envelope,
     local_clock,
+    KIND_ACTIVITY,
     KIND_CHAT,
     KIND_FILE,
     KIND_HELLO,
@@ -41,6 +42,10 @@ from ..protocol import (
 )
 from .. import activity, peers
 from .. import themes
+from ..config import watch_status_settings
+from ..stats import read_stats
+from . import statusbar
+from .statusbar import money_text
 from .daemon import DaemonPaths, effective_state, is_running, read_status
 from .inbox import Inbox
 
@@ -51,6 +56,51 @@ MIN_ROSTER_ROWS = 3
 #: Lines per wheel notch. Three is what terminals and pagers settled on.
 WHEEL_LINES = 3
 POLL_SECONDS = 0.25
+
+#: The key legend, per view, in two lengths. It is a segment of the bottom row
+#: like any other and is the first thing given up when the pane is narrow: it
+#: says the same six things every session, so it is the piece a reader has
+#: already read.
+#:
+#: The short form exists because giving it up entirely was too blunt. The full
+#: legend is ninety columns, so on anything under about a hundred and thirty —
+#: which is most panes, with a batch figure and a quota beside it — the keys
+#: vanished altogether, and the legend is how anybody learns the viewer. The
+#: short form keeps the two that are not guessable: how to get back to the live
+#: end, and how to leave.
+CHAT_KEYS = ("wheel/tab: pane · ↑↓ pgup/pgdn: scroll · [ ]: roster · "
+             "End/G: newest · Home/g: top · q: quit")
+CHAT_KEYS_SHORT = "End/G: newest · tab: pane · q: quit"
+ROSTER_KEYS = "wheel · ↑↓ pgup/pgdn: scroll · Home/End: top/end · q: quit"
+ROSTER_KEYS_SHORT = "Home/End: top/end · q: quit"
+
+#: KINDS THAT ARE STATE, NOT CONVERSATION.
+#:
+#: `collab working` and `collab idle` publish KIND_ACTIVITY to the hub and it
+#: reaches everybody, exactly like a message — but it is not one. It is this
+#: agent's state, and the answer to «what is bob doing» is whatever the LAST
+#: one said, not the list of every one he has ever sent.
+#:
+#: The conversation pane had no case for it, so it fell through to the branch
+#: that prints `env.text or str(env.body)`. That landed two ways, and the
+#: quieter one was the worse: the hub copies `what` into the envelope's `text`,
+#: so `collab working "the token refresh"` drew a perfectly ORDINARY BUBBLE
+#: reading «the token refresh» over bob's name — indistinguishable from bob
+#: having said it. Only `collab idle` with no note, where `text` is empty, fell
+#: all the way through to `str(env.body)` and drew a raw Python dict. A dict on
+#: screen is obviously broken and somebody fixes it; a plausible sentence
+#: attributed to a colleague is the one that survives.
+#:
+#: An agent that says what it is working on, which is the thing this project
+#: asks agents to do constantly, was spamming the transcript every human reads.
+#:
+#: Nothing is lost by dropping them here: the roster pane above shows each
+#: participant's current activity, live, which is the right shape for a state —
+#: one line per person, replaced, rather than one line per change, accumulated.
+#: `collab listen` and `collab watch --no-follow` still render them, with the
+#: `◉` mark and `activity.describe`, because an agent's event stream genuinely
+#: wants each transition.
+NOT_CONVERSATION = (KIND_ACTIVITY,)
 
 #: HOW MANY MESSAGES THE PANE HOLDS AT ONCE, and how many it opens with.
 #:
@@ -451,13 +501,6 @@ def _theme_version() -> int:
     return int(_THEME_CACHE.get("version", 0))
 
 
-def _fmt_money(value: Any) -> str:
-    try:
-        return f"${float(value):.2f}"
-    except (TypeError, ValueError):
-        return ""
-
-
 def _fmt_pct(value: Any, label: str) -> str:
     try:
         return f"{label} {float(value):.0f}%"
@@ -490,7 +533,7 @@ def stat_line(person: dict[str, Any]) -> str:
         bits.append(str(stats["model"]))
     if (quota := quota_text(stats)):
         bits.append(quota)
-    if (money := _fmt_money(stats.get("cost_usd"))):
+    if (money := money_text(stats.get("cost_usd"))):
         bits.append(money)
     if stats.get("tokens_in") is not None:
         try:
@@ -571,6 +614,11 @@ class Model:
     events: list[Envelope] = field(default_factory=list)
     snapshot: dict[str, Any] = field(default_factory=dict)
     status: dict[str, Any] = field(default_factory=dict)
+    #: OUR OWN usage figures, for the bottom row. Read beside the snapshot and
+    #: not on the draw path: the row is composed four times a second and the
+    #: figures move once every few minutes at best, so reading the file per
+    #: frame would be a hundred reads to notice one change.
+    own_stats: dict[str, Any] = field(default_factory=dict)
     _seen: int = 0
     #: Whether anything older than what is loaded exists; None = not asked yet.
     _older: bool | None = None
@@ -660,7 +708,8 @@ class Model:
         redraw. Opening on what is on screen and reaching back for the rest is
         the difference between a pane that appears and one that arrives.
         """
-        self.events = self.inbox.all_events(limit=min(limit or WINDOW, WINDOW))
+        self.events = self.inbox.all_events(limit=min(limit or WINDOW, WINDOW),
+                                            exclude=NOT_CONVERSATION)
         self._older = None
         self._sync_seen()
         self.refresh_side()
@@ -708,7 +757,7 @@ class Model:
         if not self.events or not self.more_above():
             return 0
         first = int(getattr(self.events[0], "seq", 0) or 0)
-        older = self.inbox.before(first, limit=count)
+        older = self.inbox.before(first, limit=count, exclude=NOT_CONVERSATION)
         self._older = None
         if not older:
             return 0
@@ -721,7 +770,7 @@ class Model:
         if not self.events or not self.pending():
             return 0
         last = int(getattr(self.events[-1], "seq", 0) or 0)
-        newer = self.inbox.after(last, limit=count)
+        newer = self.inbox.after(last, limit=count, exclude=NOT_CONVERSATION)
         if not newer:
             return 0
         self.events.extend(newer)
@@ -730,13 +779,13 @@ class Model:
 
     def load_tail(self) -> None:
         """Back to the live end, however far away it is."""
-        self.events = self.inbox.all_events(limit=WINDOW)
+        self.events = self.inbox.all_events(limit=WINDOW, exclude=NOT_CONVERSATION)
         self._older = None
         self._sync_seen()
 
     def load_start(self) -> None:
         """To the beginning, in one read rather than a page at a time."""
-        self.events = self.inbox.first(limit=WINDOW)
+        self.events = self.inbox.first(limit=WINDOW, exclude=NOT_CONVERSATION)
         self._older = False
 
     def pending(self) -> int:
@@ -750,7 +799,7 @@ class Model:
         if not self.events:
             return 0
         last = int(getattr(self.events[-1], "seq", 0) or 0)
-        return self.inbox.count_after(last) if last else 0
+        return self.inbox.count_after(last, exclude=NOT_CONVERSATION) if last else 0
 
     def more_above(self) -> bool:
         """Whether anything is left further back.
@@ -760,7 +809,8 @@ class Model:
         """
         if self._older is None:
             first = int(getattr(self.events[0], "seq", 0) or 0) if self.events else 0
-            self._older = bool(first) and self.inbox.has_before(first)
+            self._older = bool(first) and self.inbox.has_before(
+                first, exclude=NOT_CONVERSATION)
         return self._older
 
     def roster_is_current(self) -> bool:
@@ -810,6 +860,11 @@ class Model:
         self.status = read_status(self.profile) or self.status
         self._state = effective_state(
             self.status, running=is_running(self.profile) is not None)
+        # Not `or self.own_stats`, unlike the status above: an empty answer
+        # here means the file was never written or belongs to another agent,
+        # and holding the last figures would leave a quota on the row that
+        # nothing is refreshing any more.
+        self.own_stats = read_stats(self.profile)
 
     def poll_events(self, follow: bool = True) -> int:
         """Read whatever has been appended since we last looked.
@@ -851,10 +906,18 @@ class Model:
                     if not line:
                         continue
                     try:
-                        self.events.append(Envelope.from_dict(json.loads(line)))
-                        added += 1
+                        env = Envelope.from_dict(json.loads(line))
                     except ValueError:
                         continue
+                    # The tail is read from the log FILE rather than through
+                    # the queries above, so it needs the same rule applied by
+                    # hand: without it a `collab working` landing while you
+                    # watch put a raw state dict on screen, even though every
+                    # other way into this list filters them out.
+                    if env.kind in NOT_CONVERSATION:
+                        continue
+                    self.events.append(env)
+                    added += 1
                 self._seen = fh.tell()
         except OSError:
             return 0
@@ -895,14 +958,16 @@ _CLICK = (curses.BUTTON1_PRESSED | curses.BUTTON1_CLICKED
           | getattr(curses, "BUTTON1_DOUBLE_CLICKED", 0)
           | getattr(curses, "BUTTON1_TRIPLE_CLICKED", 0))
 
-#: The strokes of the scrollbar. A rail, the part of it you are looking at, and
-#: an end that says the conversation does not stop where the rail does.
-RAIL, THUMB, UNLOADED = "━", "█", "┄"
-
-#: And the same three drawn DOWN a column instead of along a row. The maths is
-#: one axis or the other, so `scroll_track` computes both and only the strokes
-#: differ — a second implementation of the same arithmetic is a second place
-#: for the thumb to end up in the wrong spot.
+#: The strokes of the scrollbar, drawn DOWN a column: a rail, the part of it
+#: you are looking at, and an end that says the conversation does not stop
+#: where the rail does.
+#:
+#: `scroll_track` is written for either axis because it once served two — there
+#: was a horizontal one along the bottom row as well. That row belongs to the
+#: status bar, which says more with it, so the position is told down the side
+#: and nowhere else. The `glyphs` argument stays: the arithmetic has no opinion
+#: about which way it is drawn, and a caller that wants the other axis needs no
+#: second copy of it.
 V_RAIL, V_THUMB, V_UNLOADED = "┆", "█", "┊"
 
 #: WHY TMUX'S OWN SCROLLBAR IS NOT USED FOR THIS.
@@ -917,15 +982,10 @@ V_RAIL, V_THUMB, V_UNLOADED = "┆", "█", "┊"
 #: conversation is a window of messages held in memory over a log on disk, and
 #: tmux has never seen either. Only this process knows where the reader is.
 
-#: What the track never shrinks below. At twenty-four columns everything else
-#: on the bar goes before this does: a bar with no scrollbar on it is just the
-#: line of key names we already had.
-MIN_TRACK = 8
-
-
 def scroll_track(width: int, offset: int, rows: int, total: int, *,
                  more_above: bool = False, more_below: bool = False,
-                 glyphs: tuple[str, str, str] = (RAIL, THUMB, UNLOADED)) -> str:
+                 glyphs: tuple[str, str, str] = (V_RAIL, V_THUMB,
+                                                 V_UNLOADED)) -> str:
     """The scrollbar, as `width` columns of text.
 
     It measures WHAT IS LOADED, which is not the whole conversation: the viewer
@@ -968,18 +1028,6 @@ def scroll_track(width: int, offset: int, rows: int, total: int, *,
     return "".join(track)
 
 
-def scroll_percent(offset: int, rows: int, total: int) -> int:
-    """How far down the loaded conversation the screen is.
-
-    Clamped for the same reason the track is: 0–100 should be a property of
-    this function, not a promise every caller has to keep on its behalf.
-    """
-    if total <= rows:
-        return 100
-    offset = min(max(offset, 0), total - rows)
-    return int(round(100 * offset / max(total - rows, 1)))
-
-
 @dataclass
 class Gutter:
     """A vertical scrollbar down the right edge of a pane.
@@ -1000,139 +1048,6 @@ class Gutter:
 
     def fraction(self, y: int) -> float:
         return (y - self.top) / max(self.rows - 1, 1)
-
-
-@dataclass
-class Bar:
-    """The bottom line, and where on it the things a click can hit are.
-
-    The spans are half-open column ranges and they are the ONLY thing the click
-    handler goes on. Computed with the text rather than guessed from it: a
-    handler that re-derives the button's position by searching the line for a
-    bracket is a handler that breaks the day somebody puts a bracket in a key
-    name.
-    """
-
-    line: str
-    track: tuple[int, int]
-    button: tuple[int, int] = (0, 0)
-
-
-#: What the keys line says, longest first. The bar spends its width on the
-#: scrollbar and the button and gives what is left to these, so a wide pane
-#: explains everything and a narrow one explains how to leave.
-_KEY_HINTS = (
-    " wheel/tab: pane · ↑↓ pgup/pgdn: scroll · [ ]: roster · "
-    "End/G: newest · Home/g: top · q: quit",
-    " ↑↓ pgup/pgdn: scroll · [ ]: roster · End/G: newest · q: quit",
-    " ↑↓ scroll · [ ] roster · q quit",
-    " q quit",
-    "",
-)
-
-
-def _bar_without_track(width: int, *, behind: int, following: bool) -> Bar:
-    """The same line with the scrollbar taken out of it.
-
-    Not `bottom_bar` with a zero-width track: a track of `(0, 0)` is what the
-    click handler reads as «there is nothing here», and building the line
-    around an empty span would leave every column shifted by a rail that is
-    not drawn — a button one place from where the bar says it is.
-
-    The key names take the room the rail was defending. MIN_TRACK existed to
-    stop the bar losing the only thing on it that could not be replaced by
-    knowing the keys; with no rail to protect, a narrow line spends what it
-    has on saying how to leave.
-    """
-    label = "" if following else (f"[⤓ {behind} new]" if behind
-                                  else "[⤓ newest]")
-    for keys in _KEY_HINTS:
-        text = keys.strip()
-        shown = label
-        line = f" {text}" if text else ""
-        if shown and _w(line) + _w(f"   {shown}") > width:
-            shown = ""
-        if not shown:
-            if _w(line) <= width:
-                return Bar(line=line, track=(0, 0))
-            continue
-        pad = width - _w(line) - _w(shown)
-        start = _w(line) + pad
-        return Bar(line=line + " " * pad + shown, track=(0, 0),
-                   button=(start, start + _w(shown)))
-    return Bar(line="", track=(0, 0))
-
-
-def bottom_bar(width: int, *, offset: int, rows: int, total: int,
-               behind: int = 0, following: bool = True,
-               more_above: bool = False, more_below: bool = False,
-               track: str = "always") -> Bar:
-    """Compose the bottom line for a pane this wide.
-
-    Everything on it is optional except the track. As the pane narrows the key
-    names go first —they are a reminder, and the keys work whether or not they
-    are printed— then the percentage, then the button; the scrollbar is what is
-    left standing at twenty-four columns.
-
-    UNLESS THE READER SAID NOT TO. `track` is `always`, `auto` —only where
-    there is somewhere to travel— or `off`. With no rail the percentage goes
-    with it: it measured the same thing, and a number nobody asked for is not
-    a smaller version of a picture nobody asked for. What stays is the line of
-    key names the bar grew out of, and the button, which is still the only
-    control in the viewer a mouse can reach.
-    """
-    width = max(width, 1)
-    if track == "off" or (track == "auto" and total <= rows):
-        return _bar_without_track(width, behind=behind, following=following)
-    # NOWHERE TO JUMP, NOTHING TO CLICK. Following the live end, a button
-    # labelled «newest» would do nothing when pressed, and a control that does
-    # nothing teaches people the bar is decorative.
-    label = ""
-    if not following:
-        label = f"[⤓ {behind} new]" if behind else "[⤓ newest]"
-    # PADDED, so the number never changes the width of anything. Unpadded it
-    # runs 0% → 10% → 100%, and every digit it gains is a column the rail
-    # loses: the track resized under the pointer as the reader travelled, and
-    # the same spot on it meant a different place in the conversation
-    # depending on where you already were.
-    pct = f"{scroll_percent(offset, rows, total):>3}%"
-
-    def attempt(keys: str, with_pct: bool, with_button: bool) -> Bar | None:
-        """This much on the right, if the track can still be seen."""
-        right = f"  {pct}" if with_pct else ""
-        if keys:
-            right += f"  · {keys.strip()}"
-        shown = label if (with_button and label) else ""
-        # COLUMNS, NOT CHARACTERS, all the way through: `↑↓ · ⤓` are one
-        # character and may be two columns, the mouse reports columns, and
-        # addnstr counts columns. Measuring the button's position with len()
-        # is how a button ends up one place to the left of where it is drawn.
-        span = width - _w(right) - (_w(f"  {shown}") if shown else 0)
-        if span < MIN_TRACK:
-            return None
-        track = scroll_track(span, offset, rows, total,
-                             more_above=more_above, more_below=more_below)
-        line = track + right
-        button = (0, 0)
-        if shown:
-            start = _w(line) + 2
-            line += f"  {shown}"
-            button = (start, start + _w(shown))
-        return Bar(line=line, track=(0, span), button=button)
-
-    # IN THE ORDER THINGS ARE WORTH LOSING. The key names are a reminder and
-    # the keys work without them, so they go first, one rung at a time; then
-    # the percentage, which the track already shows roughly; then the button,
-    # which is the last thing to go because it is the only one you can click.
-    candidates = [(keys, True, True) for keys in _KEY_HINTS]
-    candidates += [("", False, True), ("", False, False)]
-    for keys, with_pct, with_button in candidates:
-        if (bar := attempt(keys, with_pct, with_button)) is not None:
-            return bar
-    # Narrower than MIN_TRACK: the rail takes what there is.
-    return Bar(line=scroll_track(width, offset, rows, total,
-                                 more_above=more_above, more_below=more_below),
-               track=(0, width))
 
 
 def line_pair(line: str) -> int:
@@ -1811,15 +1726,14 @@ class Tui:
         #: wheel tell the panes apart.
         self._chat_top = 0
         self._chat_rows: list[Row] = []
-        #: The bottom line and the row it sits on, filled by draw() and read by
-        #: the click handler — the scrollbar and the «newest» button are the
-        #: only things on screen a click can hit besides «show more».
-        self._bar = Bar(line="", track=(0, 0))
-        self._bar_y = -1
-        #: The size the bar was last laid out at. Geometry only moves on a
-        #: resize —which redraws— so this is what lets the bar be laid out
-        #: again from the current scroll position without waiting for a frame.
-        self._bar_size: tuple[int, int] | None = None
+        #: Where the way back to the live end was drawn on the bottom row, as
+        #: a half-open column span, and the row it was drawn on. Recorded by
+        #: the draw rather than worked out again by the click handler: a
+        #: handler that re-derives a control's position by searching the line
+        #: for a bracket is a handler that breaks the day somebody's status
+        #: command prints one.
+        self._jump: tuple[int, int] = (0, 0)
+        self._jump_y = -1
         #: The vertical scrollbars painted this frame, if any. Empty is the
         #: ordinary case: a pane whose content fits does not get one, and does
         #: not lose the column either.
@@ -1838,6 +1752,16 @@ class Tui:
         self._chat_width = 0
         self._roster_key: tuple = ()
         self._roster_rows: list[Row] = []
+        #: The user's own command for the bottom row. It holds the last line
+        #: that command printed and runs it on a timer in a thread of its own;
+        #: the draw never does more than read the string. See statusbar.
+        self._command = statusbar.CommandSegment()
+        #: Whether the bottom row exists at all, decided once per draw and read
+        #: by the geometry: with the row off, the line it reserves belongs to
+        #: the panes, and a viewer that hid the row but kept the gap would just
+        #: have traded a useful line for a blank one.
+        self._bar = True
+        self._settings: dict[str, Any] = watch_status_settings()
 
     # -- cached layout -------------------------------------------------------
 
@@ -1977,6 +1901,15 @@ class Tui:
         # Forgotten with the frame they belong to: a gutter left behind from a
         # pane that no longer has one is a click target over live text.
         self._gutters = []
+        # ASKED ONCE PER FRAME, from the config, so a change made in another
+        # terminal reaches a pane that is already open — the same live reload
+        # `theme` has. `load_config` re-reads only when the file's mtime or
+        # size moves, so this costs a stat and nothing else.
+        self._settings = watch_status_settings()
+        self._bar = bool(self._settings["enabled"])
+        if self._bar:
+            self._command.poll(self._settings["command"],
+                               self._settings["interval"])
         height, width = win.getmaxyx()
         if height < 4 or width < 24:
             # Never into the last cell of the last row: on a one-column pane
@@ -2040,7 +1973,11 @@ class Tui:
 
         # --- geometry ------------------------------------------------------
         body_top = 2
-        body_height = height - body_top - 1
+        # The last row belongs to the bottom bar only while there IS one.
+        # Reserved unconditionally, turning the bar off bought a blank line
+        # instead of a line of conversation.
+        foot = 1 if self._bar else 0
+        body_height = height - body_top - foot
         roster_h = max(int(body_height * ROSTER_SHARE), MIN_ROSTER_ROWS)
         # Leave the conversation room to exist, but never squeeze the roster
         # out entirely: at MIN_ROSTER_ROWS-1 visible rows it renders nothing at
@@ -2089,7 +2026,14 @@ class Tui:
         was_at = self.chat.top_seq(self._chat_rows) if self._chat_rows else 0
         theme_before = self._theme_drawn
 
-        self.chat.rows = height - chat_top - 2
+        # ONE FOOT ROW, AND IT IS THE STATUS BAR'S. This branch used to draw a
+        # scrollbar of its own down there and reserved the row unconditionally;
+        # the status row got there first and says more, so the conversation's
+        # height is its arithmetic and the position is told down the side
+        # instead. `rows` is set before the gutter is measured because
+        # `_gutter_width` reads it — what comes from the previous frame is
+        # `total`, set below.
+        self.chat.rows = height - chat_top - 1 - foot
         chat_gutter = self._gutter_width(self.chat)
         chat_rows = self._conversation(width - 1 - chat_gutter * 2)
         self._chat_top = chat_top + 1
@@ -2162,56 +2106,59 @@ class Tui:
                 pass
         self._gutters.append(Gutter(x=x, top=top, rows=rows, pane=pane))
 
-    def _lay_out_bar(self, height: int, width: int) -> Bar:
-        """Work out the bottom line and remember where its parts are.
+    def _hint(self, win, height: int, width: int,
+              keys: tuple[str, str] = (CHAT_KEYS, CHAT_KEYS_SHORT),
+              notice: bool = True) -> None:
+        """The bottom row: what you are missing, then whatever else fits.
 
-        Apart from the drawing so that a click is resolved against the very
-        numbers that were painted — a handler that re-derives the button's
-        position from the text is a handler that drifts — and so that the
-        arithmetic can be tested without a terminal.
+        Scrolled back, the count is the point — «G to resume following» does not
+        say whether anything has been said since you left, which is the only
+        reason to go back down. The key is named twice, End first: it is the one
+        people try, and the one that needs no explaining. That notice goes in
+        first and `statusbar.fit` never drops it; everything after it is a
+        segment and every segment is expendable.
+
+        The line used to be cut with `line[:width - 1]`. That was right while
+        the row held nothing but ASCII key names and stopped being right the
+        moment a block bar, a `⏸` and a user's command could land on it: one
+        kanji is two columns and one character, so a character slice measured
+        the row in the wrong unit and over-ran the pane by however many wide
+        characters it contained.
         """
-        self._bar_y = height - 1
-        self._bar_size = (height, width)
-        self._bar = bottom_bar(
-            max(width - 1, 1),
-            offset=self.chat.offset, rows=self.chat.rows,
-            total=self.chat.total, behind=self.behind(),
-            following=self.chat.follow,
-            more_above=self.model.more_above(),
-            more_below=bool(self.model.pending()),
-            track=_current_theme()["scrollbar_bottom"])
-        return self._bar
-
-    def _hint(self, win, height: int, width: int) -> None:
-        """The bottom line: where you are, and the way back to what is newest.
-
-        It used to be key names only. That tells you `End` exists; it does not
-        tell you where in the conversation you are, which is the question
-        somebody who has been scrolling for ten seconds actually has. The
-        scrollbar answers it without being read, and the button answers the
-        other one — «take me back» — for a hand that is already on the mouse.
-        """
-        bar = self._lay_out_bar(height, width)
-        attr = curses.color_pair(C_DIM) | curses.A_DIM
-        if not self.chat.follow and self.behind():
-            # Something was said while you were reading back. That is the one
-            # state where this line carries news rather than a reminder.
-            attr = curses.color_pair(C_ACCENT) | curses.A_BOLD
+        room = max(width - 1, 0)
+        if not self._bar or not room:
+            return
+        behind = 0 if self.chat.follow or not notice else self.behind()
+        what = ""
+        if notice and not self.chat.follow:
+            what = (f"⏸ {behind} new below" if behind else "⏸ scrolled back")
+            what += " — End (or G) jumps to the newest"
+        line = statusbar.fit(
+            statusbar.compose(notice=what, keys=keys,
+                              batch=self.model.status.get("batch"),
+                              stats=self.model.own_stats,
+                              command=self._command.text(),
+                              segments=self._settings["segments"]),
+            room, _w, _clip)
+        # THE NOTICE IS THE WAY BACK, so a click on it is too. It already says
+        # what the click would do — «End (or G) jumps to the newest» — and it
+        # is the one part of this row that is news rather than a reminder, so
+        # it needs no bracket around it to earn a hand: the alternative was
+        # three more columns saying a second time what the sentence says once.
+        #
+        # MEASURED FROM THE LINE THAT WAS DRAWN, not from `what`. `fit` puts
+        # the notice first and never drops it, but it will CLIP it when the row
+        # cannot hold it, and a span taken from the unclipped text would then
+        # reach past the end of the row and answer clicks that landed on
+        # nothing.
+        self._jump_y = height - 1
+        self._jump = (0, min(_w(what), _w(line))) if what else (0, 0)
+        attr = (curses.color_pair(C_ACCENT) | curses.A_BOLD if behind
+                else curses.color_pair(C_DIM) | curses.A_DIM)
         try:
-            win.addnstr(height - 1, 0, bar.line, max(width - 1, 0), attr)
+            win.addnstr(height - 1, 0, line, room, attr)
         except curses.error:
             pass
-        # The button in the button's own colour, painted over the top: the rest
-        # of the line is a reminder and this is a control, and at C_DIM it read
-        # as neither.
-        if bar.button != (0, 0):
-            start, end = bar.button
-            try:
-                win.addnstr(height - 1, start, bar.line[start:end],
-                            max(width - 1 - start, 0),
-                            curses.color_pair(C_BUTTON) | curses.A_BOLD)
-            except curses.error:
-                pass
 
     def _roster_label(self, people: list) -> str:
         """Say when this is a memory rather than an observation.
@@ -2314,7 +2261,7 @@ class Tui:
             # else it does nothing — the mouse must not move the focus or
             # select by accident while somebody is reading.
             if state & _CLICK:
-                if y == self._bar_y:
+                if y == self._jump_y:
                     self._bar_click(x)
                 elif not self._gutter_click(x, y):
                     self._fold_at(y, where)
@@ -2438,29 +2385,21 @@ class Tui:
         return False
 
     def _bar_click(self, x: int) -> bool:
-        """A click on the bottom line. False when it landed on nothing.
+        """A click on the bottom row. False when it landed on nothing.
 
-        Nothing is the ordinary case — most of that line is a reminder of which
-        keys exist — and it must stay a no-op rather than being rounded to the
-        nearest control.
+        Nothing is the ordinary case — most of that row is a batch figure, a
+        spend and a reminder of which keys exist — and it stays a no-op rather
+        than being rounded to the nearest control. The one thing there that
+        answers is the way back to the live end.
 
-        THE BAR IS LAID OUT AGAIN FIRST, from where the pane is NOW. The loop
-        drains every pending event and redraws once, so a click arriving in the
-        same batch as the wheel notch before it was being resolved against the
-        previous frame's layout. Measured on a real terminal: scroll back three
-        notches, click the button that appears, and nothing happens — at click
-        time the remembered bar was still the one drawn while following the
-        live end, where there is no button at all.
+        RESOLVED AGAINST THE SPAN THE DRAW RECORDED, and only while the notice
+        is actually on the row. Following the live end there is nothing to go
+        back to, `_jump` is `(0, 0)`, and a click anywhere on the row does
+        nothing at all.
         """
-        if self._bar_size:
-            self._lay_out_bar(*self._bar_size)
-        start, end = self._bar.button
+        start, end = self._jump
         if end > start and start <= x < end:
             self.jump_to_newest()
-            return True
-        start, end = self._bar.track
-        if end > start and start <= x < end:
-            self.seek((x - start) / max(end - start - 1, 1))
             return True
         return False
 
@@ -2514,6 +2453,7 @@ class Tui:
                     max(width - 1, 0),
                     curses.color_pair(state_pair) | curses.A_BOLD)
 
+        pane.rows = height - 1 - (1 if self._bar else 0)
         pane.total = len(rows)
         pane.settle()
         for i in range(pane.rows):
@@ -2528,13 +2468,13 @@ class Tui:
                 more_below=pane is self.chat and bool(m.pending()))
 
         if self.view == "roster":
-            hint = " wheel · ↑↓ pgup/pgdn: scroll · Home/End: top/end · q: quit "
-            try:
-                win.addnstr(height - 1, 0, hint[:max(width - 1, 0)],
-                            max(width - 1, 0),
-                            curses.color_pair(C_DIM) | curses.A_DIM)
-            except curses.error:
-                pass
+            # Its own keys, and no scrolled-back notice: the roster does not
+            # follow a tail, so there is nothing to be behind. Everything else
+            # on the row — the batch, your usage, your command — is the same
+            # bar, composed the same way, and it went through the same
+            # character slice before.
+            self._hint(win, height, width, notice=False,
+                       keys=(ROSTER_KEYS, ROSTER_KEYS_SHORT))
         else:
             self._hint(win, height, width)
 

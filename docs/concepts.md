@@ -1,7 +1,7 @@
 # Concepts
 
 This page explains the parts of collab in depth: the hub, the daemon, sessions,
-the roster, activity, the task board, batches of work, and the wake.
+the roster, activity, the task board, batches of work, the wake, and settings.
 Read the [Overview](overview.md) first for how they fit together.
 
 ## The hub
@@ -107,6 +107,15 @@ Activity is a statement about now, so a new one replaces the last rather than
 adding to it.
 The daemon re-asserts an unchanged activity on a timer, which is what lets a
 reader tell "still working" from "said working, then was killed".
+
+That is also why `collab watch` keeps it out of the conversation pane and shows
+it on the roster instead.
+The right shape for a state is one line per person, replaced; a transcript is
+one line per event, accumulated, and a state drawn there reads as something
+somebody said — which nobody did.
+The agent-facing views are the other way round: `collab listen` and
+`collab watch --no-follow` render every transition, because an event stream is
+exactly what an agent wants to react to.
 
 ## The task board
 
@@ -273,3 +282,50 @@ it, `collab wake show` prints it in full, and collab never infers a command or a
 target from anything a participant said.
 Arming a command that is not one of the reviewed recipes requires `--yes`.
 For the boundary this sits inside, see [Security](security.md#the-wake-feature).
+
+## Settings
+
+Two kinds of state, split on purpose.
+A session belongs to a repository, so it lives in that repository's `.collab/`.
+Who you are and how you like things belongs to the person, so it lives once, in
+`~/.config/collab/config.json`.
+
+Every setting in that file has a command that writes it, and `collab config` is
+the index of them:
+
+```bash
+collab config                     # every setting, its value and its default
+collab config theme chat          # set one
+collab config theme --unset       # put it back to its default
+```
+
+`collab config` does not own the settings; it delegates to the same writers the
+older commands use, which is where the validation lives.
+`collab theme nonsense` and `collab config theme nonsense` refuse for the same
+reason, in the same place.
+
+Every reader validates on the way out as well as on the way in, because the
+file is edited by hand and read on the draw path of a full-screen viewer: a
+value that is the wrong type there is not an error message but a terminal left
+in a broken state.
+A setting collab does not understand is ignored rather than fatal.
+
+### The viewer's status row
+
+The last line of `collab watch` is composed of segments, and which ones it
+carries is `watch_status_segments`:
+
+- `batch` — the share of the shared batch the hub counts as done, refusing to
+  draw a bar from figures it could not refresh, exactly as the host agent's
+  status line does.
+- `stats` — your own quota and spend, which the roster rows above show for
+  everybody but which you would otherwise have to scroll to find.
+- `command` — the first line of `watch_status_command`, run on a timer in a
+  background thread and never on the redraw path.
+- `keys` — the key legend.
+
+The scrolled-back notice is not a segment.
+It is the only thing on that row that says the view is not live, so it goes
+first and is never given up for width; the segments are given up from the
+right until what is left fits, and the batch figure is the last to go because
+it is the one number two agents are both steering by.
