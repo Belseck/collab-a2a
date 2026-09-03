@@ -39,8 +39,8 @@ HOST = "jarvis"
 SESSION_ID = "demo"
 TITLE = "demo · a conversation with nobody on the other end"
 
-#: `%Y-%m-%dT%H:%M:%SZ`, which is what the wire carries and what `_day` reads
-#: the date out of by slicing.
+#: `%Y-%m-%dT%H:%M:%SZ`, which is what the wire carries and what `_day`
+#: converts to the reader's own timezone before taking a date off it.
 _WIRE = "%Y-%m-%dT%H:%M:%SZ"
 
 
@@ -55,11 +55,12 @@ def _ts(minutes_ago: float, now: _dt.datetime | None = None) -> str:
 def _backlog_day(now: _dt.datetime | None = None) -> _dt.datetime:
     """The day before the OLDEST of today's beats, not the day before now.
 
-    The difference is two minutes a day and it matters: at 00:01 UTC every one
-    of today's beats is still on yesterday's date, so a backlog anchored to
-    «now minus a day» lands on that same date and the day separator — which
-    only draws on a boundary — quietly stops existing. Anchored to the oldest
-    beat there is always exactly one boundary, at any hour.
+    The difference is two minutes a day and it matters: just after midnight
+    every one of today's beats is still on yesterday's date, so a backlog
+    anchored to «now minus a day» lands on that same date and the day
+    separator — which only draws on a boundary — quietly stops existing.
+    Anchored to the oldest beat there is a full day between the two, so the
+    boundary is there at any hour.
     """
     oldest = max(m for m, *_ in _TODAY)
     return _now(now) - _dt.timedelta(minutes=oldest, days=1)

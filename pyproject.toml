@@ -21,6 +21,11 @@ dependencies = [
     # client/bridge.py imports websockets.asyncio.server, which does not exist
     # before 13.0 and is the default implementation from 14.0.
     "websockets>=14",
+    # `zoneinfo` reads the system tzdata, and Windows ships none — without this
+    # `collab config timezone Europe/Madrid` would refuse every zone name there
+    # while working everywhere else. It is the standard fallback wheel and the
+    # marker keeps it off machines that already have a tz database.
+    "tzdata; platform_system == 'Windows'",
 ]
 
 [project.optional-dependencies]

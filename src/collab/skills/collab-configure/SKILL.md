@@ -1,6 +1,6 @@
 ---
 name: collab-configure
-description: See and change collab's settings on the user's behalf — their display name and colour, the conversation theme, whether usage is shared, how `collab watch` is laid out, and what its bottom status row carries. Use when the user asks to configure collab, change a setting, set a theme or a colour, stop sharing their usage, put something on the watch status bar, or asks "what settings does collab have" or "why is my status bar showing that".
+description: See and change collab's settings on the user's behalf — their display name and colour, the conversation theme, the timezone timestamps are read in, whether usage is shared, how `collab watch` is laid out, and what its bottom status row carries. Use when the user asks to configure collab, change a setting, set a theme or a colour, set or fix the timezone of the times and dates in the transcript, stop sharing their usage, put something on the watch status bar, or asks "what settings does collab have" or "why is my status bar showing that".
 ---
 
 # Configuring collab for the user
@@ -41,6 +41,7 @@ the project. A session belongs to a repository; a theme does not.
 | `display_name` | the name others see you as, machine-wide | the user says what they want to be called |
 | `color` | the colour others see you in, machine-wide | they ask for a specific colour |
 | `theme` | how `collab watch` lays the conversation out | they say the transcript is hard to read |
+| `timezone` | the zone dates and times are read in — an IANA name, or `auto` for the computer's own | the machine's clock is not the zone they read in, or timestamps look shifted |
 | `share_stats` | publish your quota and spend to the session | they say not to share usage |
 | `rules` | print collab's rules of conduct at `host` and `join` | they say the rules are noise — the pointer to the repo's own `COLLAB.md` prints regardless |
 | `stats_command` | a command printing your usage as JSON | this agent's host tool has no status line |
