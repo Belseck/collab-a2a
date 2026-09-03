@@ -790,7 +790,20 @@ rather than failing.
 
 Each speaker keeps the same colour throughout. `→` is someone arriving, `◆` a
 task, `▣` a file. Times are shown in **your** timezone; they travel in UTC so
-participants in different zones agree on ordering.
+participants in different zones agree on ordering. The date beside a message is
+read in that same zone, so it always names the day the clock beside it belongs
+to, and it only appears when that day is not today.
+
+By default that zone is the computer's own. If yours is set to something you do
+not read in — a server in another country, a laptop you have not re-pointed
+after moving — pin it for collab alone:
+
+```bash
+collab config timezone Europe/Madrid   # an IANA name
+collab config timezone auto            # back to the computer's own
+```
+
+An open `collab watch` picks the change up without being restarted.
 
 `--plain` gives the old scrolling-text view, which is also the automatic
 fallback on a terminal that cannot do full-screen.
@@ -1541,6 +1554,7 @@ collab config --json              # the same table, for an agent to read
 | `display_name` | the name others see | `collab name <n>` | git `user.name`, else `$USER` |
 | `color` | the colour others see you in | `collab color <hex>` | dealt from the palette |
 | `theme` | how the conversation is laid out | `collab theme <name>` | `classic` |
+| `timezone` | the zone dates and times are read in; an IANA name, or `auto` for the computer's own | — | `auto` |
 | `share_stats` | share your usage with the session | `collab stats --share on\|off` | `on` |
 | `rules` | print collab's rules of conduct at `host` and `join`; the pointer to the repo's own `COLLAB.md` always prints | — | `on` |
 | `watch_layout` | `split`, `tmux`, `chat` or `roster` | `collab watch --layout <l> --save` | `split` |

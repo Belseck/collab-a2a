@@ -33,6 +33,8 @@ from ..config import SessionProfile
 from ..protocol import (
     Envelope,
     local_clock,
+    local_datetime,
+    local_today,
     KIND_ACTIVITY,
     KIND_CHAT,
     KIND_FILE,
@@ -1213,18 +1215,33 @@ MONTHS = ("jan", "feb", "mar", "apr", "may", "jun",
           "jul", "aug", "sep", "oct", "nov", "dec")
 
 
+def _local_date(ts: str) -> _dt.date | None:
+    """The calendar day the stamp falls on FOR THE PERSON READING IT.
+
+    The wire is UTC; the reader is not. Taking the date off the raw string
+    while taking the clock off the converted datetime is how a message sent at
+    21:30 last night came out headed «today» — the two halves came from two
+    different days. Both now come off `local_datetime`.
+    """
+    parsed = local_datetime(ts)
+    return parsed.date() if parsed else None
+
+
 def _day(ts: str) -> str:
-    return ts[:10] if len(ts) >= 10 else ""
+    """The grouping key for the day separators, in the reader's timezone."""
+    d = _local_date(ts)
+    if d is None:
+        return ts[:10] if len(ts) >= 10 else ""
+    return d.isoformat()
 
 
 def _day_label(ts: str) -> str:
     """«today», «yesterday» or the date. A messaging app does not make you
     work it out."""
-    try:
-        d = _dt.date.fromisoformat(_day(ts))
-    except (ValueError, TypeError):
+    d = _local_date(ts)
+    if d is None:
         return _day(ts)
-    delta = (_dt.date.today() - d).days
+    delta = (local_today() - d).days
     if delta == 0:
         return "today"
     if delta == 1:
@@ -1238,14 +1255,13 @@ def _stamp(ts: str) -> str:
     The date only appears when it is needed. Always showing it means six extra
     characters on every message to tell you something you already knew.
     """
-    clock = local_clock(ts)
-    try:
-        d = _dt.date.fromisoformat(ts[:10])
-    except (ValueError, TypeError):
+    when = local_datetime(ts)
+    if when is None:
+        return local_clock(ts)
+    clock = when.strftime("%H:%M")
+    if when.date() == local_today():
         return clock
-    if d == _dt.date.today():
-        return clock
-    return f"{d.day} {MONTHS[d.month - 1]} {clock}"
+    return f"{when.day} {MONTHS[when.month - 1]} {clock}"
 
 
 def _fold_lines_to(lines: list[str], fold: int, open_now: bool) -> tuple[list[str], int]:

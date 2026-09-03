@@ -402,6 +402,79 @@ def set_rules(enabled: bool) -> bool:
     return bool(enabled)
 
 
+#: «auto» is the machine's own zone, which is what collab did before this
+#: setting existed and what almost everybody wants. It is stored as the ABSENCE
+#: of the key, not as the string: somebody who moves and re-points their laptop
+#: at a new zone should not have to remember they once pinned it here.
+TIMEZONE_AUTO = "auto"
+
+#: The words people reach for when they mean «stop overriding it».
+_TIMEZONE_AUTO_WORDS = ("auto", "system", "local", "machine", "default", "none")
+
+
+def _zone(name: str) -> Any:
+    """An IANA zone by name, or None when this machine cannot resolve it.
+
+    `zoneinfo` reads the system tzdata, and a slim container may not ship any —
+    hence the `tzdata` wheel as a fallback and hence None rather than an
+    exception here. The setter turns None into a refusal the user can read; the
+    renderer turns it into the machine's own zone, which is the only thing it
+    can do with nobody there to ask.
+    """
+    from zoneinfo import ZoneInfo
+    try:
+        return ZoneInfo(name)
+    except Exception:
+        return None
+
+
+def timezone_name() -> str:
+    """The zone stamps are read in: an IANA name, or «auto» for the machine's."""
+    value = str(load_config().get("timezone") or "").strip()
+    return value or TIMEZONE_AUTO
+
+
+def reading_timezone() -> Any:
+    """The tzinfo to render timestamps in — None meaning «ask the machine».
+
+    NONE IS A REAL ANSWER, not a failure: `datetime.astimezone(None)` is
+    documented as the local zone, so the caller passes this straight through
+    and the unconfigured case stays exactly the behaviour collab always had.
+
+    A configured name this machine can no longer resolve also falls back to the
+    machine, silently, because this runs once per drawn message with nobody to
+    warn. `collab config timezone` is where a bad name gets refused out loud.
+    """
+    name = timezone_name()
+    if name == TIMEZONE_AUTO:
+        return None
+    return _zone(name)
+
+
+def set_timezone(name: str) -> str:
+    """Store an IANA zone name, or clear it back to the machine's own.
+
+    Raises rather than storing something unresolvable: a zone that silently did
+    not take is a transcript timestamped an hour wrong with nothing on screen
+    to explain it.
+    """
+    n = (name or "").strip()
+    cfg = load_config()
+    if not n or n.lower() in _TIMEZONE_AUTO_WORDS:
+        if "timezone" in cfg:
+            cfg.pop("timezone")
+            save_config(cfg)
+        return TIMEZONE_AUTO
+    if _zone(n) is None:
+        raise ValueError(
+            f"«{n}» is not a timezone this machine knows. Use an IANA name "
+            "like Europe/Madrid or America/Bogota, or «auto» for the "
+            "machine's own")
+    cfg["timezone"] = n
+    save_config(cfg)
+    return n
+
+
 #: How `collab watch` arranges itself.
 #:
 #: ``split``  one window, roster above the conversation (works anywhere)
@@ -1022,6 +1095,15 @@ def settings() -> tuple[Setting, ...]:
                 "auto", _fold_value,
                 lambda: "auto" if fold_override() is None else fold_override(),
                 lambda v: set_fold_override(v)),
+        # NOT `reading_timezone()`, which answers with a tzinfo object and
+        # answers «the machine's» as None. What belongs on this line is the
+        # word that was stored, so that reading it back tells you whether you
+        # pinned a zone or are following the computer.
+        Setting("timezone", "the timezone dates and times are read in; «auto» "
+                            "follows the computer's own",
+                TIMEZONE_AUTO, str,
+                timezone_name,
+                lambda v: set_timezone(v)),
         Setting("share_stats", "publish your quota and spend to the session",
                 SHARE_STATS_DEFAULT, _as_bool,
                 share_stats_enabled,

@@ -11,7 +11,7 @@ from __future__ import annotations
 import time
 import unicodedata
 import uuid
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -221,14 +221,39 @@ def now_iso() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
 
-def local_clock(ts: str, fmt: str = "%H:%M") -> str:
-    """Render a wire timestamp in the reader's own timezone.
+def _reading_zone() -> Any:
+    """The zone the reader has configured, or None for the computer's own.
 
-    UTC is right for the wire and wrong for a person reading a transcript on
-    their own machine.
+    IMPORTED HERE AND NOT AT THE TOP: `config` imports this module, so the
+    dependency only runs one way at import time. It costs nothing per call —
+    `load_config` caches on the file's stamp — and reading it live is what
+    makes `collab config timezone` reach a viewer that is already open.
+    """
+    try:
+        from .config import reading_timezone
+        return reading_timezone()
+    except ImportError:  # pragma: no cover - protocol must render regardless
+        return None
+
+
+def local_datetime(ts: str) -> datetime | None:
+    """A wire timestamp as one aware datetime in the reader's own timezone.
+
+    THE SINGLE PLACE THE CONVERSION HAPPENS. Everything a person reads beside a
+    message — the clock, the day it belongs to, whether that day is today — has
+    to come off this one datetime. When the clock was converted here and the
+    date was sliced out of the raw UTC string instead, the two halves of one
+    stamp described different days for anybody whose evening or morning falls
+    on the far side of the UTC midnight.
+
+    The zone is the computer's unless `collab config timezone` says otherwise;
+    either way it is the same zone for both halves, which is the point.
+
+    ``None`` when the stamp cannot be read at all; callers degrade to showing
+    the raw characters rather than inventing a date.
     """
     if not ts:
-        return ""
+        return None
     try:
         parsed = datetime.strptime(ts, "%Y-%m-%dT%H:%M:%SZ").replace(
             tzinfo=timezone.utc
@@ -237,10 +262,35 @@ def local_clock(ts: str, fmt: str = "%H:%M") -> str:
         try:
             parsed = datetime.fromisoformat(ts.replace("Z", "+00:00"))
         except ValueError:
-            return ts[11:16] if len(ts) >= 16 else ts
+            return None
         if parsed.tzinfo is None:
             parsed = parsed.replace(tzinfo=timezone.utc)
-    return parsed.astimezone().strftime(fmt)
+    return parsed.astimezone(_reading_zone())
+
+
+def local_clock(ts: str, fmt: str = "%H:%M") -> str:
+    """Render a wire timestamp in the reader's own timezone.
+
+    UTC is right for the wire and wrong for a person reading a transcript on
+    their own machine.
+    """
+    if not ts:
+        return ""
+    parsed = local_datetime(ts)
+    if parsed is None:
+        return ts[11:16] if len(ts) >= 16 else ts
+    return parsed.strftime(fmt)
+
+
+def local_today() -> date:
+    """Today IN THE SAME ZONE the stamps are rendered in.
+
+    `date.today()` is the computer's, and asking «is this message from today?»
+    with the computer's answer while dating the message in a configured zone is
+    the original bug again, one layer up: an hour either side of midnight the
+    two disagree and a message gets labelled with the wrong day.
+    """
+    return datetime.now(_reading_zone()).date()
 
 
 @dataclass
