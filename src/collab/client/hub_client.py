@@ -24,7 +24,22 @@ DEFAULT_TIMEOUT = 15.0
 
 
 class HubError(RuntimeError):
-    pass
+    """Something went wrong talking to a hub.
+
+    ``status`` is the HTTP status when the hub replied, and 0 when it could not
+    be reached at all. The two read identically to a caller and mean opposite
+    things: without the distinction, somebody whose password was simply wrong
+    gets an explanation about unreachable addresses.
+    """
+
+    def __init__(self, *args: object, status: int = 0) -> None:
+        super().__init__(*args)
+        self.status = status
+
+    @property
+    def answered(self) -> bool:
+        """Did the hub reply and refuse, rather than not being there?"""
+        return self.status > 0
 
 
 class HubClient:
@@ -58,32 +73,53 @@ class HubClient:
             )
         except httpx.HTTPError as exc:
             raise HubError(f"cannot reach the hub at {self.base_url}: {exc}") from exc
-        if r.status_code == 401:
+        if r.status_code in (401, 429):
             # The hub says *why* — a stale invite and a revoked token are very
-            # different problems, and guessing sends people the wrong way.
+            # different problems, and guessing sends people the wrong way. A
+            # rate limit is the same kind of answer: already a sentence for a
+            # person, and worse for having a route name pinned to the front.
             detail = ""
             try:
                 detail = str(r.json().get("detail") or "")
             except ValueError:
                 detail = ""
             raise HubError(detail or "the hub rejected this token — you may have "
-                                     "been removed from the session")
+                                     "been removed from the session",
+                           status=r.status_code)
         if r.status_code >= 400:
             detail = ""
             try:
                 detail = r.json().get("detail") or r.text
             except ValueError:
                 detail = r.text
-            raise HubError(f"{method} {path} failed ({r.status_code}): {detail}")
+            raise HubError(f"{method} {path} failed ({r.status_code}): {detail}",
+                           status=r.status_code)
         return r.json()
 
     # --- session --------------------------------------------------------------
 
-    def join(self, invite: str, name: str, hello: dict[str, Any]) -> dict[str, Any]:
-        return self._request(
-            "POST", f"{EXT_PREFIX}/join",
-            json={"invite": invite, "name": name, "hello": hello},
-        )
+    def join(self, invite: str, name: str, hello: dict[str, Any],
+             auth: dict[str, str] | None = None) -> dict[str, Any]:
+        payload: dict[str, Any] = {"invite": invite, "name": name, "hello": hello}
+        if auth:
+            payload["auth"] = auth
+        return self._request("POST", f"{EXT_PREFIX}/join", json=payload)
+
+    def challenge(self) -> dict[str, Any]:
+        """Ask for the parameters and nonce for one password attempt.
+
+        A session with no password is a real answer rather than a failure — it
+        is how a joiner who was handed a password learns the host never set
+        one — so it is said in those words, not as a 404 with a route in it.
+        """
+        try:
+            return self._request("POST", f"{EXT_PREFIX}/auth/challenge", json={})
+        except HubError as exc:
+            if exc.status == 404:
+                raise HubError(
+                    "this session has no password — ask the host for the join "
+                    "link, which carries an invite code", status=404) from None
+            raise
 
     def health(self) -> dict[str, Any]:
         return self._request("GET", f"{EXT_PREFIX}/health")

@@ -11,6 +11,7 @@ from pathlib import Path
 
 from .. import peers
 from ..config import collab_home, ensure_home
+from ..password import new_record
 from .auth import new_secret
 from .store import Store
 
@@ -38,6 +39,11 @@ class HubConfig:
     domain: str = ""
     pid: int = 0
     home: str = ""
+    #: Whether the host set a session password. A FLAG, NOT THE PASSWORD — the
+    #: password is never written anywhere, in any form; only the store holds
+    #: what verifies it. This is here so the CLI can print the right share line
+    #: without opening the database.
+    has_password: bool = False
 
     def __post_init__(self) -> None:
         if not self.home:
@@ -108,9 +114,16 @@ def new_session_id() -> str:
 
 
 def create_session(host_name: str, port: int, bind: str = "127.0.0.1",
-                   domain: str = "", title: str = "") -> HubConfig:
-    """Mint a session with fresh credentials and seed its store."""
+                   domain: str = "", title: str = "",
+                   password: str = "") -> HubConfig:
+    """Mint a session with fresh credentials and seed its store.
+
+    ``password``, if given, is the credential the host can say out loud; it is
+    derived on the way in and the plaintext is not kept. Raises
+    :class:`collab.password.PasswordError` for one too weak to be a door.
+    """
     ensure_home()
+    record = new_record(password) if password else None
     cfg = HubConfig(
         session_id=new_session_id(),
         host_name=host_name,
@@ -120,6 +133,7 @@ def create_session(host_name: str, port: int, bind: str = "127.0.0.1",
         host_token=new_secret(),
         domain=domain,
         title=title,
+        has_password=record is not None,
     )
     cfg.save()
 
@@ -128,6 +142,8 @@ def create_session(host_name: str, port: int, bind: str = "127.0.0.1",
     store.add_invite(cfg.invite, ttl_seconds=24 * 3600, max_uses=0)
     store.add_participant(cfg.host_name, cfg.host_token, is_host=True)
     store.add_room("general", cfg.host_name)
+    if record is not None:
+        store.set_password(record)
     store.close()
     return cfg
 
@@ -175,7 +191,7 @@ def session_summary(cfg: HubConfig) -> dict[str, int]:
 
 
 def resume_session(cfg: HubConfig, port: int, bind: str = "127.0.0.1",
-                   domain: str = "") -> HubConfig:
+                   domain: str = "", password: str = "") -> HubConfig:
     """Bring a previous session back on a fresh port, with a new way in.
 
     The **data** carries over — the session id, the event log, the task board —
@@ -183,6 +199,13 @@ def resume_session(cfg: HubConfig, port: int, bind: str = "127.0.0.1",
     previously issued one is retired and a new one minted, so a link shared
     days ago cannot quietly let someone back in. Re-sharing is a decision the
     host makes each time.
+
+    **The password does carry over**, and the asymmetry is deliberate. A link
+    is a secret that travels: forwarded, pasted into a channel, left in a
+    terminal someone else scrolls. A password is one the host chose, holds, and
+    hands over deliberately — and it is not recoverable from here, so retiring
+    it would lock the host out of their own arrangement to no one's benefit.
+    Passing ``password`` replaces it; there is no way to be handed the old one.
     """
     cfg.port = port
     cfg.bind = bind
@@ -191,11 +214,15 @@ def resume_session(cfg: HubConfig, port: int, bind: str = "127.0.0.1",
     cfg.public_url = ""
     cfg.tunnel = "none"
 
+    record = new_record(password) if password else None
     store = Store(cfg.db_path)
     try:
         store.clear_invites()
         cfg.invite = new_secret()
         store.add_invite(cfg.invite, ttl_seconds=24 * 3600, max_uses=0)
+        if record is not None:
+            store.set_password(record)
+        cfg.has_password = store.has_password()
     finally:
         store.close()
 
@@ -258,3 +285,14 @@ def join_line(cfg: HubConfig) -> str:
     """The single line a host hands to someone else."""
     base = cfg.public_url or cfg.local_url
     return f"collab join {base}#{cfg.invite}"
+
+
+def password_join_line(cfg: HubConfig) -> str:
+    """The line for a session with a password: an address, and no secret in it.
+
+    Empty when there is no password. This is the whole point of the feature —
+    the link can go in a channel, and the credential goes over a call.
+    """
+    if not cfg.has_password:
+        return ""
+    return f"collab join {cfg.public_url or cfg.local_url} --password"

@@ -67,9 +67,10 @@ from .client.context import gather as ctx_gather
 from .protocol import (DEFAULT_ROOM, MAX_FILE_BYTES, ROOM_FILE_TTL_SECONDS,
                        Envelope, KIND_CHAT, KIND_HELLO, file_outcome, scrub,
                        scrub_block, short_state)
+from .password import PasswordError, check_new_password
 from .server.session import (HubConfig, create_session, hosted_sessions,
-                             join_line, resume_session, session_summary,
-                             stop_session)
+                             join_line, password_join_line, resume_session,
+                             session_summary, stop_session)
 from .server.tunnel import NO_NGROK_HELP, free_port, local_ip, ngrok_version
 
 # --- output helpers ----------------------------------------------------------
@@ -429,6 +430,40 @@ def _ago_seconds(seconds: float) -> str:
 
 # --- commands -----------------------------------------------------------------
 
+#: What `--password` means when it is given no value: ask, and read the answer
+#: without echoing it. A password typed on the command line is in the shell's
+#: history and in every process list on the machine for as long as the command
+#: runs, so the empty form is the one the docs lead with.
+ASK_FOR_PASSWORD = "\x00ask"
+
+
+def _password_arg(value: str, *, confirm: bool) -> str:
+    """Resolve ``--password`` into the secret itself.
+
+    Raises :class:`PasswordError` with something a person can act on, which is
+    what the two callers turn into a message and a non-zero exit.
+    """
+    if not value:
+        return ""
+    if value != ASK_FOR_PASSWORD:
+        return value
+    if not sys.stdin.isatty():
+        raise PasswordError(
+            "no terminal to ask on — pass the password as a value "
+            "(`--password '<secret>'`), knowing it lands in your shell history"
+        )
+    import getpass
+
+    secret = getpass.getpass("Session password: ")
+    if confirm:
+        # Asked twice because it cannot be read back: what the hub keeps
+        # verifies a password, it does not reveal one. A typo here is a
+        # session nobody can join, discovered by the other person.
+        if secret != getpass.getpass("Again: "):
+            raise PasswordError("those two do not match")
+    return secret
+
+
 def cmd_host(args: argparse.Namespace) -> int:
     _warn_outside_venv()
     _preflight_update(args)
@@ -437,6 +472,16 @@ def cmd_host(args: argparse.Namespace) -> int:
     ensure_home()
     name = resolve_name(args.name)
     port = args.port or free_port()
+
+    # Before anything is created: a session that came up and then refused its
+    # own password would leave a half-made room to clean up.
+    try:
+        password = _password_arg(getattr(args, "password", ""), confirm=True)
+        if password:
+            check_new_password(password)
+    except PasswordError as exc:
+        fail(str(exc))
+        return 1
 
     # A session is a conversation and a task board. Closing the terminal should
     # not throw those away, so a repo's previous session is picked up by
@@ -447,7 +492,11 @@ def cmd_host(args: argparse.Namespace) -> int:
         previous = [c for c in previous if c.session_id == wanted] or previous
 
     if previous and not args.fresh:
-        cfg = resume_session(previous[0], port, bind=args.bind, domain=args.domain)
+        # Read before the resume: `resume_session` updates this same object,
+        # so afterwards there is nothing left to compare against.
+        had_password = previous[0].has_password
+        cfg = resume_session(previous[0], port, bind=args.bind, domain=args.domain,
+                             password=password)
         if args.title:
             cfg.title = args.title
             cfg.save()
@@ -459,10 +508,15 @@ def cmd_host(args: argparse.Namespace) -> int:
                     f"{plural(counts.get('open_tasks', 0), 'open task')} kept")
             print(f"       {dim(kept)}")
         print(f"       {dim('new invite — any link shared before no longer works')}")
+        if cfg.has_password:
+            what = ("password replaced" if password and had_password
+                    else "password set" if password else "password kept")
+            print(f"       {dim(what + ' — a link travels, a password does not')}")
         print(f"       {dim('start clean instead with: collab host --fresh')}")
     else:
         cfg = create_session(name, port, bind=args.bind, domain=args.domain,
-                             title=args.title or args.focus or "")
+                             title=args.title or args.focus or "",
+                             password=password)
         if previous:
             note = ("started a new session; the previous one is kept and can be "
                     "brought back with `collab host --resume`")
@@ -556,6 +610,15 @@ def cmd_host(args: argparse.Namespace) -> int:
 
     heading("Share this one line with the other person")
     print("  " + c(join_line(cfg), "1;32"))
+    if cfg.has_password:
+        # The point of a password is that THIS line is safe to put somewhere
+        # the link is not — a channel, an issue, a README — because on its own
+        # it opens nothing. So it is shown as the alternative it is, with the
+        # reminder that the secret half travels separately.
+        print(dim("  or, for somewhere a secret should not go:"))
+        print("  " + c(password_join_line(cfg), "1;32"))
+        print(dim("  (they are asked for the password; tell them over a call, "
+                  "not in the same place as the link)"))
     if not cfg.public_url:
         print(dim(f"  (local only — LAN address is http://{local_ip()}:{cfg.port})"))
 
@@ -980,6 +1043,12 @@ def cmd_join(args: argparse.Namespace) -> int:
         return code
     ensure_home()
 
+    try:
+        password = _password_arg(getattr(args, "password", ""), confirm=False)
+    except PasswordError as exc:
+        fail(str(exc))
+        return 1
+
     url = args.url
     if args.local or not url or not _looks_like_a_link(url):
         # A SESSION ID IS NOT A URL, AND THE USER DID NOT ASK FOR A LESSON.
@@ -1043,7 +1112,7 @@ def cmd_join(args: argparse.Namespace) -> int:
     try:
         profile, snapshot, status = onboard.join_session(
             url, name=args.name, focus=args.focus,
-            start_daemon=not args.no_daemon,
+            start_daemon=not args.no_daemon, password=password,
         )
     except (ValueError, HubError) as exc:
         fail(str(exc))
@@ -1057,6 +1126,14 @@ def cmd_join(args: argparse.Namespace) -> int:
                 print(dim("  that session is down, but this repo still has it:"))
                 _describe_stopped(stopped)
                 print(dim("\n  `collab host` brings it back — the data is kept"))
+        elif getattr(exc, "answered", False):
+            # THE HUB WAS THERE AND SAID NO. Everything below this line explains
+            # a link that reached nothing, and none of it is true here — a wrong
+            # password, an expired invite and a name already taken are all
+            # answers from the session the link names. Saying "that link is not
+            # one of the sessions running here" sends someone to check an
+            # address that was never the problem.
+            pass
         elif (here := [p for p in peers.discover() if p.joinable]):
             # A LINK THAT NO LONGER REACHES ANYTHING, while a session sits on
             # this machine. The link is not guessed at — a stale one names a
@@ -3039,6 +3116,8 @@ def cmd_url(args: argparse.Namespace) -> int:
         fail("only the host can print the invite line for a session")
         return 1
     print(join_line(cfg))
+    if cfg.has_password:
+        print(password_join_line(cfg))
     if cfg.tunnel == "ngrok" and not cfg.domain:
         print(dim("  (a free tunnel gets a new address if it restarts — re-run this to "
                   "get the current link, or use `collab host --domain` to pin one)"))
@@ -4034,6 +4113,11 @@ def build_parser() -> argparse.ArgumentParser:
                    help="a name for the session, shown to everyone")
     h.add_argument("--domain", default="",
                    help="a reserved ngrok domain, so the URL survives a tunnel restart")
+    h.add_argument("--password", nargs="?", const=ASK_FOR_PASSWORD, default="",
+                   metavar="SECRET",
+                   help=("set a session password, so the plain link can be shared "
+                         "without the invite code; with no value you are asked for "
+                         "it, which keeps it out of your shell history"))
     h.add_argument("--no-tunnel", action="store_true", help="skip ngrok even if installed")
     h.add_argument("--no-daemon", action="store_true", help="do not start listening")
     h.add_argument("--no-update-check", action="store_true",
@@ -4078,6 +4162,11 @@ def build_parser() -> argparse.ArgumentParser:
     j.add_argument("--local", action="store_true",
                    help="join a session running on this machine, no link needed")
     j.add_argument("--name", help="your display name")
+    j.add_argument("--password", nargs="?", const=ASK_FOR_PASSWORD, default="",
+                   metavar="SECRET",
+                   help=("join with the session password instead of an invite "
+                         "code, so a plain URL is enough; with no value you are "
+                         "asked for it"))
     j.add_argument("--focus", default="", help="what you are working on, announced on arrival")
     j.add_argument("--home", default="", metavar="FOLDER",
                    help="state folder for this session (default .collab, or"

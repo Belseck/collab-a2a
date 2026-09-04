@@ -55,6 +55,7 @@ kill "$(cat /tmp/A/sessions/<id>/daemon.pid)"
 ```
 src/collab/
   protocol.py      the envelope and the extension's shared constants
+  password.py      the session password: derivation, and the join challenge
   config.py        per-repo .collab/ resolution, names, session profiles
   cli.py           every command
   server/
@@ -63,7 +64,8 @@ src/collab/
     store.py       SQLite; the append-only event log is the backbone
     events.py      the SSE feed and Last-Event-ID resume
     executor.py    bridges A2A SendMessage into the hub
-    auth.py        invites, per-participant tokens, the bearer backend
+    auth.py        invites, per-participant tokens, the bearer backend,
+                   and the password handshake's nonces and failure budget
     card.py        the Agent Card
     tunnel.py      ngrok detection
   peers.py         the machine-wide registry: local discovery, co-location
@@ -93,6 +95,15 @@ longer exists. Most of the resume tests exist to catch exactly that.
 **`from` is never client-supplied.** The hub sets it from the authenticated
 participant. Anything that lets a client choose its own sender is a security
 bug, not a feature.
+
+**The session password never reaches the hub.** Not in the clear, and not as a
+hash — a hash on the wire *is* the credential, and a recorded one replays. What
+travels is a proof bound to a single-use nonce, and what the hub stores is a
+hash of a key only the password derives, so neither a recorded exchange nor a
+stolen database is a way in. `tests/test_session_password.py` asserts both, and
+`tests/test_password_cli.py` watches the actual request bodies. Anything that
+adds a second path to the password — a debug log, an echo, a field on the join
+body — is a security bug.
 
 **Direct messages must be filtered on replay too**, not just on live delivery.
 It is easy to add a new read path and forget; `test_replayed_dms_stay_private`

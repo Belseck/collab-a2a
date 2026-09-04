@@ -27,6 +27,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
 
+from ..password import PasswordRecord
 from ..protocol import Envelope
 
 SCHEMA = """
@@ -66,6 +67,20 @@ CREATE TABLE IF NOT EXISTS invites (
     expires_at REAL,
     max_uses   INTEGER NOT NULL DEFAULT 0,
     uses       INTEGER NOT NULL DEFAULT 0
+);
+
+-- THE SESSION PASSWORD, IF THE HOST SET ONE. At most one row, ever — the
+-- CHECK is what says so, rather than a convention every writer has to keep.
+-- Nothing here reveals the password: `stored_key` is a hash of a key only the
+-- password derives, so a copy of this file lets nobody in. See
+-- collab.password for why it is that value and not the key itself.
+CREATE TABLE IF NOT EXISTS session_password (
+    id         INTEGER PRIMARY KEY CHECK (id = 1),
+    algorithm  TEXT NOT NULL,
+    salt       TEXT NOT NULL,
+    iterations INTEGER NOT NULL,
+    stored_key TEXT NOT NULL,
+    created_at REAL NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS rooms (
@@ -652,6 +667,40 @@ class Store:
             )
             self._db.commit()
         return True, ""
+
+    # --- the session password -------------------------------------------------
+
+    def set_password(self, record: PasswordRecord) -> None:
+        """Install the session's password, replacing any previous one.
+
+        Takes a derived record, never a plaintext: the store is the thing that
+        gets written to disk, backed up and copied around, and the narrowest
+        way to guarantee it never holds a password is for it never to be
+        handed one.
+        """
+        with self._lock:
+            self._db.execute(
+                "INSERT OR REPLACE INTO session_password"
+                " (id, algorithm, salt, iterations, stored_key, created_at)"
+                " VALUES (1,?,?,?,?,?)",
+                (record.algorithm, record.salt, record.iterations,
+                 record.stored_key, time.time()),
+            )
+            self._db.commit()
+
+    def password_record(self) -> PasswordRecord | None:
+        with self._lock:
+            row = self._db.execute(
+                "SELECT * FROM session_password WHERE id=1").fetchone()
+        if row is None:
+            return None
+        return PasswordRecord(
+            salt=row["salt"], iterations=int(row["iterations"]),
+            stored_key=row["stored_key"], algorithm=row["algorithm"],
+        )
+
+    def has_password(self) -> bool:
+        return self.password_record() is not None
 
     # --- rooms ---------------------------------------------------------------
 

@@ -271,6 +271,20 @@ current link. To keep one address across restarts, pin a reserved domain:
 collab host --domain your-name.ngrok-free.app
 ```
 
+The link carries the invite code, which makes it the credential — fine for a
+direct message, less so for a channel other people read. To share an address
+instead of a secret, give the session a password:
+
+```bash
+collab host --password
+```
+
+You are asked for it, so it never lands in your shell history, and the join line
+becomes a plain URL: `collab join https://a1b2c3.ngrok.app --password`. The
+password never crosses the network in any form, hashed or otherwise — see
+[Security](docs/security.md#the-session-password) for the handshake. The invite
+link keeps working; a password adds a way in rather than closing one.
+
 **Guest:**
 ```bash
 collab join 'https://a1b2c3.ngrok.app#INVITE' --focus "the client side"
@@ -602,6 +616,8 @@ collab 1.7.0 — let coding agents talk to each other
 |---|---|
 | `collab host` | start a session, open a tunnel, print the join line, come up listening |
 | `collab join <url>#<invite>` | join, announce yourself, come up listening, print the snapshot |
+| `collab host --password` | set a session password, so a plain URL is enough to join with |
+| `collab join <url> --password` | join with that password instead of an invite code |
 | `collab send <text>` | post to a room, `--to NAME` for a direct message |
 | `collab listen --follow` | stream events as lines (what a Monitor watches) |
 | `collab recv --wait N` | drain unread, optionally waiting |

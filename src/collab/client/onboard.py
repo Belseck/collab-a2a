@@ -17,6 +17,7 @@ from typing import Any
 from urllib.parse import urlparse, urlunparse
 
 from ..config import SessionProfile, resolve_name
+from ..password import ALGORITHM, PasswordError, client_proof
 from ..protocol import DEFAULT_ROOM
 from . import context as ctx
 from . import exclusive
@@ -27,22 +28,52 @@ from .hub_client import HubClient, HubError
 DAEMON_READY_TIMEOUT = 20.0
 
 
-def split_join_url(raw: str) -> tuple[str, str]:
+def split_join_url(raw: str, *, invite_required: bool = True) -> tuple[str, str]:
     """Split ``https://host#invite`` into ``(base_url, invite)``.
 
     The invite rides in the fragment so it is never sent in a request line and
     stays out of proxy and server logs.
+
+    A bare URL is only an address, and on its own it opens nothing — hence
+    ``invite_required``. It is lowered when the caller holds a password, which
+    is the other credential the hub accepts and the reason a host can share the
+    plain link at all.
     """
     parsed = urlparse(raw.strip())
     if not parsed.scheme:
         parsed = urlparse("https://" + raw.strip())
     invite = parsed.fragment
     base = urlunparse((parsed.scheme, parsed.netloc, parsed.path.rstrip("/"), "", "", ""))
-    if not invite:
+    if not invite and invite_required:
         raise ValueError(
-            "that URL has no invite code — it should look like https://host#CODE"
+            "that URL has no invite code — it should look like https://host#CODE, "
+            "or pass --password if the host set one for the session"
         )
     return base, invite
+
+
+def password_proof(client: HubClient, password: str) -> dict[str, str]:
+    """Turn a password into the one thing that is safe to send.
+
+    Two steps rather than one because the hub chooses the salt and the nonce:
+    ask for a challenge, answer it. The password itself never leaves this
+    function — see :mod:`collab.password`.
+    """
+    challenge = client.challenge()
+    nonce = str(challenge.get("nonce") or "")
+    salt = str(challenge.get("salt") or "")
+    if not nonce:
+        raise HubError("the hub's password challenge carried no nonce")
+    try:
+        proof = client_proof(
+            password, salt=salt,
+            iterations=int(challenge.get("iterations") or 0),
+            nonce=nonce,
+            algorithm=str(challenge.get("algorithm") or ALGORITHM),
+        )
+    except PasswordError as exc:
+        raise HubError(str(exc)) from exc
+    return {"nonce": nonce, "proof": proof}
 
 
 def spawn_daemon(profile: SessionProfile) -> int:
@@ -113,17 +144,19 @@ def join_session(
     room: str = DEFAULT_ROOM,
     start_daemon: bool = True,
     cwd: Path | None = None,
+    password: str = "",
 ) -> tuple[SessionProfile, dict[str, Any], dict[str, Any]]:
     """Join, announce, and come up listening.
 
     Returns ``(profile, snapshot, daemon_status)``.
     """
-    base, invite = split_join_url(url)
+    base, invite = split_join_url(url, invite_required=not password)
     hello = ctx.gather(focus, cwd=cwd)
     wanted = resolve_name(name)
 
     with HubClient(base) as client:
-        result = client.join(invite, wanted, hello)
+        auth = password_proof(client, password) if password else None
+        result = client.join(invite, wanted, hello, auth=auth)
 
     profile = SessionProfile(
         session_id=result["session_id"],

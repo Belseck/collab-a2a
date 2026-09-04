@@ -97,11 +97,13 @@ speak them.
 
 ### 3.2 The extension surface
 
-All of these require `Authorization: Bearer <participant token>` except `/join`.
+All of these require `Authorization: Bearer <participant token>` except `/join`
+and `/auth/challenge`.
 
 | Method | Path | Purpose |
 |---|---|---|
-| `POST` | `/ext/collab/v1/join` | invite + `hello` → token, id **+ session snapshot**. `409` if the name is taken |
+| `POST` | `/ext/collab/v1/join` | invite **or** password proof, + `hello` → token, id **+ session snapshot**. `409` if the name is taken |
+| `POST` | `/ext/collab/v1/auth/challenge` | salt, iterations and a single-use nonce for one password attempt; `404` if the session has no password |
 | `GET` | `/ext/collab/v1/events` | **SSE feed**, honours `Last-Event-ID` |
 | `POST` | `/ext/collab/v1/messages` | post an envelope (convenience; `SendMessage` does the same) |
 | `GET` | `/ext/collab/v1/history` | backfill, `?room=&limit=` |
@@ -154,6 +156,50 @@ The hub then **broadcasts the `hello`** to everyone already present, so an
 arriving agent shows up in their feed with its repo, branch and stated focus —
 they can answer without being told to go and look.
 
+### 4.1 Joining with the session password
+
+A session may carry a password, which is the credential a host can say out loud
+— so the plain URL becomes shareable. It is an **alternative** to the invite,
+not a second factor: a link already handed out keeps working.
+
+The password is never sent, in the clear or hashed. A hash on the wire *is* the
+credential and replays, so this is a challenge–response in the shape of SCRAM
+(RFC 5802):
+
+```jsonc
+// POST /ext/collab/v1/auth/challenge   (no auth)
+{ "algorithm": "pbkdf2-sha256", "salt": "<hex>",
+  "iterations": 600000, "nonce": "<single-use>", "expires_in": 120 }
+```
+
+```
+salted_password = PBKDF2-HMAC-SHA256(password, salt, iterations)
+client_key      = HMAC-SHA256(salted_password, "Client Key")
+stored_key      = SHA256(client_key)             // all the hub keeps
+auth_message    = "<algorithm>:<iterations>:<salt>:<nonce>"
+proof           = client_key XOR HMAC-SHA256(stored_key, auth_message)
+```
+
+```jsonc
+// POST /ext/collab/v1/join
+{ "name": "bob", "hello": { ... },
+  "auth": {"nonce": "<the one just issued>", "proof": "<hex>"} }
+```
+
+The hub recovers `client_key` from the proof and checks that its SHA-256 is the
+`stored_key` it holds. Three properties follow, and each is deliberate:
+
+- **No replay.** The nonce is spent on first use, whether the proof was right or
+  wrong — otherwise one challenge would be an unlimited number of guesses.
+- **A stolen database is not a credential.** `stored_key` is a *hash* of the
+  client key, so it verifies a proof without being able to build one.
+- **The cost is on the joiner.** PBKDF2 runs client-side; the hub verifies with
+  two hashes and cannot be exhausted by join attempts.
+
+`auth_message` carries every parameter the hub offered, so a challenge altered
+in flight — fewer rounds, a chosen salt — yields a proof the real hub rejects. A
+joiner refuses a challenge outside 100,000–5,000,000 rounds for the same reason.
+
 ## 5. The live feed
 
 `GET /ext/collab/v1/events` → `text/event-stream`
@@ -183,9 +229,10 @@ log identical and makes seq-based resume sound.
 | Scheme | `http` / `bearer`, declared in `AgentCard.securitySchemes` |
 | Invite | `secrets.token_urlsafe(32)`, TTL 24 h, optional max-uses |
 | Token | `secrets.token_urlsafe(32)`, one per participant, revocable |
-| Storage | SHA-256 hashes only; a token is looked up by the hash of what was presented, so the raw secret is never stored or compared |
+| Password | optional, chosen by the host; PBKDF2-HMAC-SHA256 at 600 000 rounds over a 16-byte salt. See §4.1 |
+| Storage | SHA-256 hashes only; a token is looked up by the hash of what was presented, so the raw secret is never stored or compared. The password's stored key is a hash of a key only the password derives, so it verifies a proof without being able to build one |
 | Failure | `401` with `WWW-Authenticate: Bearer realm="collab"` |
-| Rate limit | `/join` — 10 attempts per minute per IP |
+| Rate limit | `/join` — 10 attempts per minute per IP; `/auth/challenge` — 20. Five *failed* credentials in a minute closes both for that IP |
 
 The invite travels in the **URL fragment** (`https://host#CODE`), so it is never
 sent in a request line and stays out of proxy and server logs.

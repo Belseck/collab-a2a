@@ -45,6 +45,46 @@ requires that token.
   taken from the message, so a participant cannot attribute a message to someone
   else.
 
+### The session password
+
+A host can set a password with `collab host --password`, which makes the plain
+session URL a second way in: no invite code in the link, the secret handed over
+separately.
+It is an addition to the invite, not a replacement — a link already shared keeps
+working.
+
+**The password is never sent to the hub, in any form.**
+Not in the clear, and not as a hash either: a hash sent over the wire *is* the
+credential, and anyone who records one can replay it.
+Joining is a challenge–response built the way SCRAM (RFC 5802) builds one.
+
+- The hub stores a random salt, an iteration count, and a *stored key*.
+  The stored key is the SHA-256 of a key that only the password derives, so
+  reading the hub's database does not give anyone a way in.
+- A joiner asks for a challenge, which carries the salt, the iteration count and
+  a single-use nonce, and answers with a proof derived from the password.
+- The proof is bound to that nonce and to every parameter the hub offered, so a
+  recorded proof cannot be replayed and a challenge altered in flight produces a
+  proof the real hub rejects.
+- Key derivation is PBKDF2-HMAC-SHA256 at 600,000 rounds — OWASP's floor — and
+  it runs on the joiner.
+  The hub verifies with two hashes, so join attempts cannot be used to exhaust
+  it.
+- A joiner refuses a challenge asking for fewer than 100,000 rounds or more than
+  5,000,000, so neither a weakened derivation nor a hostile one is accepted.
+- Five *failed* credential attempts per minute, per address, closes both the join
+  and the challenge endpoint for the rest of that minute.
+  Only failures are counted, so a room filling up normally never trips it.
+- The password must be at least 8 characters.
+  It is not recoverable — the hub keeps what verifies a password, not the
+  password — so `collab host --password` asks for it twice.
+
+A password is a weaker secret than an invite code: an invite is 256 bits of
+randomness, a password is something a person chose and can say out loud.
+That is the trade, and it is deliberate — it buys a link that is safe to put
+where a secret is not.
+Choose one accordingly, and send it by a different route than the link.
+
 ### Attributable, isolated messages
 
 Delivery and visibility are decided on a stable participant id, not a display
@@ -123,6 +163,10 @@ Be clear-eyed about the limits.
   a room member harmless.
   If you want a genuinely clean guest list, start a new session rather than
   resuming one, which retires every earlier invite.
+  Note that resuming retires the invites and **keeps** the password: a link
+  travels and gets forwarded, a password is handed over deliberately, and the
+  host cannot be given the old one back to re-share.
+  Replace it with `collab host --resume --password`, or start fresh.
 - **The host sees everything.**
   The hub stores the whole conversation in its SQLite log.
   Whoever hosts the session can read all of it.
@@ -147,6 +191,9 @@ Be clear-eyed about the limits.
 ## Reducing your exposure
 
 - Share invite links over a private channel, and treat them as passwords.
+- Where the link has to go somewhere less private, set a session password
+  instead and send the two halves by different routes — the URL in the channel,
+  the password over a call.
 - Start a fresh session, rather than resuming, when the guest list should change.
 - Remove a participant you no longer trust with `collab kick`; their token stops
   working immediately.

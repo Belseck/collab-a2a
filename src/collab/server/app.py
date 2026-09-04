@@ -52,7 +52,8 @@ from ..protocol import (
     new_id,
     short_state,
 )
-from .auth import BearerBackend, RateLimiter, new_secret
+from ..password import verify_proof
+from .auth import BearerBackend, ChallengeCache, RateLimiter, new_secret
 from .card import build_agent_card
 from .events import event_stream
 from .executor import CollabAgentExecutor
@@ -140,6 +141,19 @@ def create_app(
     )
 
     join_limiter = RateLimiter(limit=10, window=60.0)
+    # A SEPARATE BUDGET FOR CREDENTIALS THAT DID NOT WORK. The limiter above
+    # counts every attempt, which is the right shape for "one host, a handful
+    # of joins" and the wrong one for a password: a password is guessable in a
+    # way a 256-bit invite is not, and a session URL that is public is one an
+    # attacker can hammer. This one is charged only on failure, so a room
+    # filling up normally never touches it, and five wrong answers a minute is
+    # all anyone gets.
+    credential_limiter = RateLimiter(limit=5, window=60.0)
+    # Its own budget rather than a share of the join one: a password join costs
+    # a challenge AND a join, so spending both from the same allowance would
+    # quietly halve how many people can arrive in a minute.
+    challenge_limiter = RateLimiter(limit=20, window=60.0)
+    challenges = ChallengeCache()
 
     def resolve_target(name: str | None) -> tuple[str, str]:
         """Turn a DM target into ``(display_name, participant_id)``.
@@ -155,11 +169,106 @@ def create_app(
         person = store.participant_by_id(pid)
         return (person.name if person else name), pid
 
+    # --- extension: the password handshake -------------------------------------
+
+    @app.post(f"{EXT_PREFIX}/auth/challenge", tags=["collab"])
+    async def auth_challenge(request: Request) -> dict[str, Any]:
+        """Hand out the parameters and the nonce for one password attempt.
+
+        Unauthenticated, necessarily: this is what somebody holding nothing but
+        the URL asks for before they can prove anything. It gives away the salt
+        and the iteration count, which are not secrets — they are what makes
+        the joiner's derivation match the host's — and one single-use nonce.
+        """
+        client = request.client.host if request.client else "unknown"
+        if credential_limiter.blocked(client):
+            raise HTTPException(
+                status_code=429,
+                detail="too many failed attempts, wait a minute and try again")
+        if not challenge_limiter.allow(client):
+            raise HTTPException(status_code=429,
+                                detail="too many password attempts, slow down")
+        record = await asyncio.to_thread(store.password_record)
+        if record is None:
+            # 404, not 401: nothing is being refused. There is no password on
+            # this session, so the answer is "ask the host for the join link",
+            # and an agent that reads status codes should not go looking for
+            # better credentials.
+            raise HTTPException(
+                status_code=404,
+                detail=("this session has no password — ask the host for the "
+                        "join link, which carries an invite code"),
+            )
+        return {
+            "algorithm": record.algorithm,
+            "salt": record.salt,
+            "iterations": record.iterations,
+            "nonce": challenges.issue(),
+            "expires_in": challenges.ttl,
+        }
+
     # --- extension: join ------------------------------------------------------
+
+    async def _admit(body: dict[str, Any], client: str) -> None:
+        """Check the way in.  Returns quietly, or raises 401/429.
+
+        TWO CREDENTIALS, EITHER OF WHICH OPENS THE DOOR. The invite is the
+        link; the password is the thing a host can read out over a call. They
+        are alternatives on purpose — setting a password does not retire the
+        links already shared, because a host who adds one mid-session is
+        widening the ways in, not revoking the one everybody is already using.
+        """
+        code = str(body.get("invite") or "")
+        auth = body.get("auth")
+        proof = str((auth or {}).get("proof") or "") if isinstance(auth, dict) else ""
+        nonce = str((auth or {}).get("nonce") or "") if isinstance(auth, dict) else ""
+
+        if not code and not proof:
+            has_password = await asyncio.to_thread(store.has_password)
+            raise HTTPException(
+                status_code=401,
+                detail=("this session needs an invite code"
+                        + (" or the session password" if has_password else "")),
+            )
+
+        reason = ""
+        if code:
+            # THE INVITE IS TRIED FIRST, AND WITHOUT THE FAILURE BUDGET. That
+            # budget exists because a password is guessable; an invite is 256
+            # bits and is not. Charging both would let somebody guessing at the
+            # password shut out everyone arriving on a good link from the same
+            # address — a NAT, an office, a CI runner — which is a way to
+            # break a session by attacking it badly.
+            ok, reason = await asyncio.to_thread(store.consume_invite, code)
+            if ok:
+                return
+        if proof:
+            if credential_limiter.blocked(client):
+                raise HTTPException(
+                    status_code=429,
+                    detail="too many failed attempts, wait a minute and try again",
+                )
+            record = await asyncio.to_thread(store.password_record)
+            if record is None:
+                reason = "this session has no password set"
+            # The nonce is spent whatever the outcome. A proof that failed
+            # must not leave its nonce alive for the next guess to reuse —
+            # that would turn one challenge into an unlimited number of tries.
+            elif not challenges.consume(nonce):
+                reason = "that password challenge has expired — try again"
+            elif verify_proof(record, nonce=nonce, proof=proof):
+                return
+            else:
+                reason = "wrong password"
+            # Charged here and nowhere else, for the reason given above: this
+            # is the branch where guessing is a strategy.
+            credential_limiter.record(client)
+
+        raise HTTPException(status_code=401, detail=reason or "unknown invite code")
 
     @app.post(f"{EXT_PREFIX}/join", tags=["collab"])
     async def join(request: Request) -> dict[str, Any]:
-        """Exchange an invite for a token, and return the session snapshot.
+        """Exchange an invite or a password for a token, and return the snapshot.
 
         The snapshot comes back in this same response so a joining agent's very
         first output already knows who is here and what they are doing.
@@ -169,10 +278,7 @@ def create_app(
             raise HTTPException(status_code=429, detail="too many join attempts, slow down")
 
         body = await request.json()
-        code = str(body.get("invite") or "")
-        ok, reason = await asyncio.to_thread(store.consume_invite, code)
-        if not ok:
-            raise HTTPException(status_code=401, detail=reason)
+        await _admit(body if isinstance(body, dict) else {}, client)
 
         # Both come from an untrusted joiner and both are then replayed to every
         # roster, so they are bounded before they reach the store rather than

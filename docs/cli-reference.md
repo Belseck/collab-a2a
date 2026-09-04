@@ -56,9 +56,9 @@ Start a session and print a link to share.
 
 ```text
 collab host [--name NAME] [--port PORT] [--bind BIND] [--focus FOCUS]
-            [--home FOLDER] [--title TITLE] [--domain DOMAIN] [--no-tunnel]
-            [--no-daemon] [--no-update-check] [--update] [--fresh]
-            [--resume [SESSION_ID]]
+            [--home FOLDER] [--title TITLE] [--domain DOMAIN]
+            [--password [SECRET]] [--no-tunnel] [--no-daemon]
+            [--no-update-check] [--update] [--fresh] [--resume [SESSION_ID]]
 ```
 
 | Flag | Meaning |
@@ -70,6 +70,7 @@ collab host [--name NAME] [--port PORT] [--bind BIND] [--focus FOCUS]
 | `--home FOLDER` | State folder for this session. |
 | `--title TITLE` | A name for the session, shown to everyone. |
 | `--domain DOMAIN` | A reserved ngrok domain, so the URL survives a tunnel restart. |
+| `--password [SECRET]` | Set a session password, so the plain URL is enough to join with. With no value you are asked for it, which keeps it out of your shell history. |
 | `--no-tunnel` | Skip ngrok even if it is installed. |
 | `--no-daemon` | Do not start listening. |
 | `--no-update-check` | Do not check for a newer collab first. |
@@ -121,16 +122,18 @@ Join a session.
 With no arguments, join the one running on this machine.
 
 ```text
-collab join [--agent AGENT] [--local] [--name NAME] [--focus FOCUS]
-            [--home FOLDER] [--no-daemon] [--no-update-check] [--update] [url]
+collab join [--agent AGENT] [--local] [--name NAME] [--password [SECRET]]
+            [--focus FOCUS] [--home FOLDER] [--no-daemon] [--no-update-check]
+            [--update] [url]
 ```
 
 | Argument or flag | Meaning |
 |---|---|
-| `url` | The join URL (`https://host#INVITE`), or the session id or repository name of a session already running on this machine. |
+| `url` | The join URL (`https://host#INVITE`), or the plain URL when you have the session password, or the session id or repository name of a session already running on this machine. |
 | `--agent AGENT` | Which of this repository's agents is joining. |
 | `--local` | Look the name up on this machine, and never read it as an address. Anything that is not an address is looked up anyway, so this only forces it. A session found this way is joined at the address the hub answers on this machine — loopback, not the shared tunnel — and every later request stays there. |
 | `--name NAME` | Your display name. |
+| `--password [SECRET]` | Join with the session password instead of an invite code, so a plain URL is enough. With no value you are asked for it. |
 | `--focus FOCUS` | What you are working on, announced on arrival. |
 | `--home FOLDER` | State folder for this session. |
 | `--no-daemon` | Do not start listening. |

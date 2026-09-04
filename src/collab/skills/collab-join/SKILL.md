@@ -68,6 +68,18 @@ throw away everything after it.
 `--name` is optional; without it collab uses the user's global name. Names must
 be unique in a session, so pass one if the default is already taken.
 
+**If the URL has no `#` on it**, the host set a session password and the link is
+just an address. Ask the user for the password rather than guessing at one:
+
+```bash
+collab join 'https://a1b2c3.ngrok.app' --password
+```
+
+With no value it asks and reads the password without echoing, which is the form
+to use — a password typed as `--password '<secret>'` is in the shell history and
+in every process list on the machine while the command runs. Never put a
+password you were told into a command line, a message, or a file.
+
 If collab is not installed, follow `AGENT_INSTALL.md` first.
 
 **If the join is refused** with *the name is already taken*, someone in the

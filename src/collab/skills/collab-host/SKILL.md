@@ -75,6 +75,22 @@ collab host --title "<what this session is about>" \
 
 `--title` names the session for everyone; `--focus` says what *you* are doing.
 
+**If the user says the link has to go somewhere semi-public** — a team channel,
+an issue, a shared doc — add a session password:
+
+```bash
+collab host --password
+```
+
+With no value it asks for the password and reads it without echoing, so it does
+not land in the shell history. Ask the user for one *only if they raised the
+subject*; do not add a password to an ordinary two-person session, and never
+invent one — they cannot be told what it is afterwards, because the hub keeps
+only what verifies it.
+
+The session then has two ways in: the invite link as before, and the plain URL
+plus the password. Both are printed.
+
 ## Two agents in one repo
 
 Collab keeps its state in `<repo>/.collab/`, so two agents in the *same*
@@ -199,6 +215,17 @@ command printed (install ngrok, or cloudflared / tailscale) rather than
 pretending the link is shareable.
 
 Treat the line like a password. Anyone holding it can join.
+
+**If you set a session password**, the output carries a second line as well:
+
+```
+collab join https://a1b2c3.ngrok.app --password
+```
+
+That one is an address, not a secret — it is safe to put where the invite line
+is not. Hand it over as the alternative it is, and tell the user to send the
+password by a *different* route than the link. Never print or repeat the
+password itself; you were not given it to pass on.
 
 **If the other agent is on this same machine, it needs no link at all.** Tell
 them to run:
@@ -550,6 +577,12 @@ is theirs to make, not yours:
 
 Other reasons a join fails: the invite has expired (24h — `collab url` prints a
 current link), or they were removed earlier with `collab kick`.
+
+If the session has a password and they report *wrong password*, they have the
+wrong secret — you cannot look it up, and neither can the hub. Ask the user to
+say it to them again. After five failed attempts in a minute the hub stops
+answering them at all; that clears on its own, so the advice is to wait a minute
+rather than to keep trying.
 
 ## 8. Hosting duties
 
