@@ -61,25 +61,41 @@ def test_an_ordinary_send_never_closes_a_pending_decision(tmp_path):
 
 # --- exact-subject dedupe ------------------------------------------------------------
 
-def test_the_same_versioned_subject_from_the_same_asker_joins_one_decision(tmp_path):
+def test_a_new_question_on_the_same_subject_is_its_own_decision_linked_to_the_first(tmp_path):
+    """jarvis's probe: 'May I take T_c144?' then 'T_c144 tests fail on Windows: ship or wait?'."""
     store = store_on(tmp_path)
-    ask(store, seq=0, question="Rebase #141 now?", subject="PR#141@087570a")
-    ask(store, seq=0, question="Is the #141 rebase go-ahead accurate?", subject="PR#141@087570a")
-    pending = store.pending()
-    assert len(pending) == 1 and pending[0]["follow_ups"] == ["Is the #141 rebase go-ahead accurate?"]
+    ask(store, seq=0, question="May I take T_c144?", subject="T_c144c7ad2773")
+    ask(store, seq=0, question="T_c144 tests fail on Windows: ship or wait?", subject="T_c144c7ad2773")
+    first, second = store.pending()
+    assert second["related"] == [first["id"]] and "follow_ups" not in first, "linked, never merged"
+    from collab import worker_notices
+    store.configure({"agent": "claude", "scope": "Coordinate"})
+    notice = worker_notices.claim(tmp_path)
+    assert "fail on Windows" in notice["text"] and f"related to {first['id']}" in notice["text"]
 
 
-@pytest.mark.parametrize("second", [
-    {"subject": "PR#141@bddbfba"},                  # changed SHA: a new question
-    {"source_id": "p_c"},                            # same subject, someone else asking
-    {"private": True},                               # same asker, private versus public
-    {"subject": ""},                                 # no subject: never fuzzy-matched
-    {"source_id": ""},                               # unknown asker: no dedupe
-])
-def test_anything_short_of_an_exact_match_stays_a_separate_decision(tmp_path, second):
+def test_only_an_exact_duplicate_from_the_same_asker_is_dropped(tmp_path):
     store = store_on(tmp_path)
-    ask(store, seq=0, question="Rebase #141 now?", subject="PR#141@087570a")
-    ask(store, seq=0, **{"question": "Rebase #141 now, really?", "subject": "PR#141@087570a", **second})
+    ask(store, seq=0, question="Rebase #141 now?")
+    ask(store, seq=0, question="  rebase   #141 NOW?  ")          # same words: one decision
+    assert len(store.pending()) == 1
+    ask(store, seq=0, question="Rebase #141 now?", source_id="p_c")  # someone else asking
+    ask(store, seq=0, question="Rebase #141 now?", private=True)     # same asker, other audience
+    assert len(store.pending()) == 3
+
+
+def test_d4_no_subject_never_links_or_merges(tmp_path):
+    store = store_on(tmp_path)
+    ask(store, seq=0, question="First question?")
+    ask(store, seq=0, question="Second question?")
+    assert [("related" in p) for p in store.pending()] == [False, False]
+
+
+def test_d3_a_decision_awaiting_the_human_is_never_joined(tmp_path):
+    store = store_on(tmp_path)
+    ask(store, seq=0, question="Ship 2.2 today?")
+    store.await_human(store.pending()[0]["id"], "asking my human", to="bob")
+    ask(store, seq=0, question="Ship 2.2 today?")                   # word-for-word, but the first is with the human
     assert len(store.pending()) == 2
 
 
@@ -102,7 +118,7 @@ async def test_main_sent_reaches_the_turn_and_alone_starts_no_turn(conversation,
         calls.append(args[2])
         return {"summary": "", "replies": [], "escalations": []}
     monkeypatch.setattr("collab.worker_runtime.run_turn", run)
-    store.send("Rebased #141: 087570a", to="bob")
+    store.send("Rebased #141: 087570a", to="", room="general")   # a public send: visible in every turn
     await conversation.turn()
     assert calls == [], "the main agent's own send is context, not a reason to spend a turn"
     incoming(conversation, 1, "Is #141 rebased?")
@@ -138,3 +154,52 @@ async def test_a_hub_rejection_during_flush_stays_failed(conversation, tmp_path)
     entry = next(e for e in store.snapshot()["main_sent"] if e["id"] == rid)
     assert entry["status"] == "failed", entry
     assert store.outbox() == []
+
+
+
+def _peer(name, pid):
+    return {"name": name, "id": pid}
+
+
+@pytest.mark.asyncio
+async def test_a_private_send_is_shown_only_in_a_turn_answering_its_recipient(conversation, tmp_path, monkeypatch):
+    configure(conversation, tmp_path)
+    conversation.daemon.snapshot = {"participants": [_peer("alice", "p_a"), _peer("bob", "p_b"), _peer("carol", "p_c")]}
+    store = worker.Store(conversation.root)
+    secret = "key rotation Friday 18:00, do not share"
+    store.send(secret, to="bob")
+    seen = []
+    async def run(*args, **kwargs):
+        seen.append(args[2]["main_sent"][0])
+        return {"summary": "", "replies": [], "escalations": []}
+    monkeypatch.setattr("collab.worker_runtime.run_turn", run)
+    conversation.daemon.inbox.record(Envelope(seq=1, kind="chat", sender="carol", sender_id="p_c", text="news?"))
+    await conversation.turn()
+    conversation.daemon.inbox.record(Envelope(seq=2, kind="chat", sender="bob", sender_id="p_b", text="and?"))
+    await conversation.turn()
+    assert seen[0]["text"] == "sent a private reply to bob" and seen[0]["redacted"]
+    assert seen[1]["text"] == secret, "in a turn answering bob, bob's own reply is visible"
+
+
+@pytest.mark.asyncio
+async def test_a_reply_repeating_a_private_send_to_someone_else_is_withheld(conversation, tmp_path, monkeypatch):
+    configure(conversation, tmp_path)
+    conversation.daemon.snapshot = {"participants": [_peer("alice", "p_a"), _peer("bob", "p_b"), _peer("carol", "p_c")]}
+    store = worker.Store(conversation.root)
+    secret = "key rotation Friday 18:00, do not share"
+    store.send(secret, to="bob")
+    for record in store.outbox():
+        store.acknowledge(record["id"])
+    conversation.daemon.inbox.record(Envelope(seq=1, kind="chat", sender="carol", sender_id="p_c", text="news?"))
+    async def run(*args, **kwargs):
+        return worker_runtime.validate_result({"summary": "", "escalations": [], "replies": [
+            {"text": f"FYI: {secret}", "to": "carol", "room": ""}]})
+    monkeypatch.setattr("collab.worker_runtime.run_turn", run)
+    sent = []
+    async def transport(request):
+        sent.append(json.loads(request.content)["text"])
+        return httpx.Response(200, json={"seq": 3})
+    async with httpx.AsyncClient(transport=httpx.MockTransport(transport)) as client:
+        conversation.daemon._http = client
+        await conversation.turn()
+    assert sent == [] and store.status()["dropped_replies"] == 1

@@ -283,6 +283,25 @@ class Conversation:
 
         return await asyncio.wait_for(send(), timeout=timeout)
 
+    def _visible_main_sent(self, ledger, events, selected):
+        """The main agent's sends as this turn may see them.
+
+        A private send appears in full only in a turn answering that same
+        recipient (by participant id); everywhere else it is reduced to the
+        fact that a private reply went to them, so no turn can repeat it to
+        someone else.
+        """
+        ids = {p.get("name"): p.get("id") for p in self.daemon.snapshot.get("participants", [])
+               if p.get("name") and p.get("id")}
+        seqs = {c["seq"] for c in selected}
+        answering = {getattr(e, "sender_id", "") for e in events if e.seq in seqs} - {""}
+        shown = []
+        for entry in ledger:
+            if entry.get("private") and ids.get(entry.get("to")) not in answering:
+                entry = {**entry, "text": f"sent a private reply to {entry.get('to', '')}", "redacted": True}
+            shown.append(entry)
+        return shown
+
     def _source(self, record):
         """A compact summary cannot be trusted to remember a reply address."""
         if "question" in record:
@@ -384,7 +403,7 @@ class Conversation:
                 "retained_main_context": snapshot.get("retained_context", []),
                 # What the main agent itself already said (latest first-come
                 # bounded ledger, with delivery status). Context only.
-                "main_sent": snapshot.get("main_sent", []),
+                "main_sent": self._visible_main_sent(snapshot.get("main_sent", []), events, selected),
                 "main_activity": _excerpt(json.dumps(activity.read_local(self.daemon.profile), ensure_ascii=False), 4000),
                 "events": selected,
                 "pending": _page([self._source(row) for row in store.pending()], budget=12_000),
@@ -479,6 +498,11 @@ class Conversation:
                 asker_rooms[row["id"]] = (source.get("room") or "") if source.get("broadcast") else ""
             open_questions = [(row["question"][:60], asker_ids[row["id"]], asker_rooms[row["id"]])
                               for row in pending_now if len(row.get("question", "")) >= 20]
+            # The main agent's private sends get the same guard: their text may
+            # reach only the participant it was sent to, by DM.
+            open_questions += [(entry["text"][:60], who(entry.get("to", "")), "")
+                               for entry in snapshot.get("main_sent", [])
+                               if entry.get("private") and len(entry.get("text", "")) >= 20]
             kept = []
             for reply in result["replies"]:
                 # Fine only for the asker: by DM, or addressed to them in the

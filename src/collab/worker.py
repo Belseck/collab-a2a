@@ -542,25 +542,27 @@ class Store:
                 db.executemany("DELETE FROM records WHERE id=? AND kind=?", [(rid, kind) for rid in ids])
             for reply in outgoing:
                 self._add(db, "outbox", reply)
+            def identity(entry):
+                return (entry["seq"], entry["reason"], entry["question"],
+                        entry.get("source_id", ""), bool(entry.get("private")))
             open_rows = self._records(db, "escalation")
-            pending = {(entry["seq"], entry["reason"], entry["question"]) for entry in open_rows}
+            # A decision with the human is never re-used for a new ask (D3).
+            pending = {identity(entry) for entry in open_rows if not entry.get("awaiting_human")}
             for decision in decisions:
-                identity = (decision["seq"], decision["reason"], decision["question"])
-                if identity in pending:
+                if identity(decision) in pending:
                     continue
-                same = self._same_subject(open_rows, decision)
-                if same is not None:
-                    # Exactly the same versioned subject, asker and audience:
-                    # a second ask joins the open decision instead of a new one.
-                    follow = (same.get("follow_ups") or [])[-4:] + [decision["question"][:500]]
-                    merged = {k: v for k, v in same.items() if k not in ("id", "created_at")}
-                    merged["follow_ups"] = follow
-                    db.execute("UPDATE records SET data=? WHERE id=? AND kind='escalation'",
-                               (json.dumps(merged), same["id"]))
-                    same.update(merged)
+                # ONE DECISION PER SOURCE MESSAGE (#113). Only an exact
+                # duplicate of an open question from the same asker and audience
+                # is dropped; anything else is its own decision, so a genuinely
+                # new question is never buried inside an older one.
+                if self._exact_duplicate(open_rows, decision) is not None:
                     continue
+                # Same versioned subject: LINKED, shown together, never merged.
+                related = [row["id"] for row in self._same_subject(open_rows, decision)]
+                if related:
+                    decision["related"] = related[-4:]
                 self._add(db, "escalation", decision)
-                pending.add(identity)
+                pending.add(identity(decision))
                 open_rows = self._records(db, "escalation")
             state.update(cursor=cursor, summary=summary, turn=state.get("turn", 0) + 1, last_progress=time.time(),
                          error="", retry_at=0, running=False)
@@ -568,21 +570,32 @@ class Store:
             return True
 
     @staticmethod
-    def _same_subject(open_rows: list[dict[str, Any]], decision: dict[str, Any]) -> dict[str, Any] | None:
-        """An open decision that is the same question: never a fuzzy match.
+    def _same_asker(row: dict[str, Any], decision: dict[str, Any]) -> bool:
+        source = decision.get("source_id")
+        return bool(source) and row.get("source_id") == source and \
+            bool(row.get("private")) == bool(decision.get("private"))
 
-        All of subject (versioned, compared exactly), asker id and audience
-        must be present and equal; anything missing means no dedupe.
+    @classmethod
+    def _exact_duplicate(cls, open_rows: list[dict[str, Any]], decision: dict[str, Any]) -> dict[str, Any] | None:
+        """The same question, word for word, from the same asker and audience, still open.
+
+        Never a decision already with the human: its answer is pending
+        elsewhere, and a new ask must stay visible on its own.
         """
-        subject, source = decision.get("subject"), decision.get("source_id")
-        if not subject or not source:
-            return None
+        text = " ".join(decision["question"].split()).casefold()
         for row in open_rows:
-            if (row.get("subject") == subject and row.get("source_id") == source
-                    and bool(row.get("private")) == bool(decision.get("private"))
-                    and not row.get("awaiting_human")):
+            if (cls._same_asker(row, decision) and not row.get("awaiting_human")
+                    and " ".join(str(row.get("question", "")).split()).casefold() == text):
                 return row
         return None
+
+    @classmethod
+    def _same_subject(cls, open_rows: list[dict[str, Any]], decision: dict[str, Any]) -> list[dict[str, Any]]:
+        """Open decisions with exactly the same versioned subject, asker and audience (for linking)."""
+        subject = decision.get("subject")
+        if not subject:
+            return []
+        return [row for row in open_rows if row.get("subject") == subject and cls._same_asker(row, decision)]
 
     def outbox(self) -> list[dict[str, Any]]:
         with self._db() as db:

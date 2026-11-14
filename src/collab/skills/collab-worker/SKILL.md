@@ -100,10 +100,14 @@ figures. The worker never addresses your human and never waits silently.
 
 Your own sends are remembered for the worker: the latest 16 (16 KiB) with
 their delivery status, so it does not ask you again what you already told a
-peer. They are context only; they never answer a pending decision. A second
-ask with the same versioned subject (for example `PR#141@087570a`), from the
-same asker and audience, joins the open decision as a follow-up; a changed
-SHA, another asker or a private/public difference stays separate.
+peer. They are context only; they never answer a pending decision. A private
+send is shown in full only in a turn answering that recipient; elsewhere it
+reads "sent a private reply to NAME", and a worker reply repeating it to
+anyone else is withheld. Each source message stays its own decision: one
+with the same versioned subject (for example `PR#141@087570a`) from the
+same asker is linked to the earlier one ("related to …") but never merged;
+only a word-for-word duplicate from the same asker and audience is dropped,
+and never into a decision already with your human.
 
 Supply outcome, acceptance evidence, ownership, dependencies and changed facts.
 Ask a focused question only when its answer changes the next action. Acknowledge
