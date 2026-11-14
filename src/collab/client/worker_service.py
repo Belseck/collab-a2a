@@ -837,6 +837,7 @@ class Conversation:
             # The main agent's private sends get the same guard: their text may
             # reach only the participant it was sent to, by DM.
             # Compared by the frozen to_id: a rename cannot redirect it (#146).
+            held_for = set()
             private_shown = {entry.get("to_id") for entry in payload["main_sent"]
                              if entry.get("private") and not entry.get("redacted") and entry.get("to_id")}
             open_questions += [(entry["text"][:60], entry.get("to_id") or "unresolved", "")
@@ -857,8 +858,17 @@ class Conversation:
                 if leak is None and private_shown and (
                         reply.get("room") or who(reply["to"]) not in private_shown):
                     leak = "private send in this turn"
+                    # Withholding a reply that carries a human answer must not
+                    # make the answer vanish: that answer is held instead.
+                    held_for.update(answer["id"] for answer in answers
+                                    if answer.get("prompt", {}).get("seq", 0) > 0
+                                    and ((answer.get("prompt", {}).get("decision_source") or {})
+                                         .get("sender_id")) == who(reply["to"]))
                 if leak is None:
                     kept.append(reply)
+            if held_for:
+                self._hold_model_answers(store, held_for, snapshot, logged)
+                return
             if dropped := len(result["replies"]) - len(kept):
                 logger.warning("dropped %d worker reply(ies) repeating an open question", dropped)
                 store.count_dropped(dropped)

@@ -316,3 +316,43 @@ async def test_a_redaction_after_a_swap_names_the_ids_current_holder_or_nobody(c
     await conversation.turn()
     assert seen[0]["text"] == "sent a private reply to bobby" and seen[0]["to"] == "bobby"
     assert seen[1]["text"] == "sent a private reply to another participant" and seen[1]["to"] == ""
+
+
+@pytest.mark.asyncio
+async def test_a_withheld_reply_carrying_a_human_answer_holds_the_answer_never_drops_it(
+        conversation, tmp_path, monkeypatch):
+    """jarvis's interplay: bob's private send is shown in full, bob's answer is to a BROADCAST
+    question, the model answers in #general; the DMs-only guard withholds it, and the human's
+    answer must be held for review, not silently counted as a dropped reply."""
+    configure(conversation, tmp_path)
+    conversation.daemon.snapshot = {"participants": [{"name": "alice", "id": "p_a"}, {"name": "bob", "id": "p_b"}]}
+    store = worker.Store(conversation.root)
+    store.send("key rotation Friday 18:00, do not share", to="bob", to_id="p_b")
+    for record in store.outbox():
+        store.acknowledge(record["id"])
+    conversation.daemon.inbox.record(Envelope(seq=1, kind="chat", sender="bob", sender_id="p_b",
+                                              room="general", text="May I merge #148?"))
+    snap = store.snapshot()
+    assert store.commit_turn(expected_cursor=snap["cursor"], cursor=1, summary="", replies=[],
+                             escalations=[{"seq": 1, "reason": "decision", "question": "May bob merge #148?"}],
+                             decision_sources={1: {"sender_id": "p_b", "sender": "bob", "room": "general",
+                                                   "broadcast": True}})
+    store.answer(store.pending()[0]["id"], "Tell bob yes, after the merge gate.", verbatim=False)
+    # bob speaks again, so this turn answers exclusively bob and shows his private send in full.
+    conversation.daemon.inbox.record(Envelope(seq=2, kind="chat", sender="bob", sender_id="p_b",
+                                              to="alice", text="and?"))
+    async def run(*args, **kwargs):
+        assert args[2]["main_sent"][0].get("redacted") is not True
+        return worker_runtime.validate_result({"summary": "", "escalations": [], "replies": [
+            {"text": "Yes, after the gate.", "to": "bob", "room": "general"}]})
+    monkeypatch.setattr("collab.worker_runtime.run_turn", run)
+    sent = []
+    async def transport(request):
+        sent.append(json.loads(request.content).get("text"))
+        return httpx.Response(200, json={"seq": 9})
+    async with httpx.AsyncClient(transport=httpx.MockTransport(transport)) as client:
+        conversation.daemon._http = client
+        await conversation.turn()
+    with store._db() as db:
+        held = db.execute("SELECT COUNT(*) FROM records WHERE kind='quarantine'").fetchone()[0]
+    assert sent == [] and held == 1, "held for review, not dropped"
