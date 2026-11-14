@@ -183,7 +183,7 @@ class Hub:
         with self.store.edit_meta(participant_id) as meta:
             if meta is None:
                 return False
-            for key in ('machine', 'machine_id', 'user', 'color'):
+            for key in ('machine_id', 'color'):  # never the raw hostname or OS account
                 if key not in body:
                     continue
                 value = str(body[key] or '')
@@ -343,7 +343,7 @@ class Hub:
                                             merged["reported_at"]))
             if merged:
                 meta["stats"] = merged
-            for key in ("machine", "machine_id", "user"):
+            for key in ("machine_id",):  # older clients still send machine/user: dropped
                 if stats.get(key):
                     meta[key] = stats[key]
 
@@ -419,9 +419,7 @@ class Hub:
                 "focus": p.meta.get("focus", ""),
                 "repo": p.meta.get("repo", ""),
                 "branch": p.meta.get("branch", ""),
-                "machine": p.meta.get("machine", ""),
                 "machine_id": p.meta.get("machine_id", ""),
-                "user": p.meta.get("user", ""),
                 # THE ROSTER FLATTENS meta, so anything not named here is
                 # dropped on the way out. The colour was stored by the hub and
                 # thrown away by this loop, which meant `collab color` worked

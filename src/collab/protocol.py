@@ -297,6 +297,10 @@ def clip(value: Any, limit: int) -> str:
     return str(value).strip()[:limit]
 
 
+#: Never stored or replayed: they name the OS account or the person.
+PRIVATE_META_KEYS = frozenset({"cwd", "machine", "user"})
+
+
 def bounded_meta(raw: Any) -> dict[str, Any]:
     """A joiner's self-declared identity, capped so it cannot be a weapon.
 
@@ -315,8 +319,8 @@ def bounded_meta(raw: Any) -> dict[str, Any]:
     for key, value in raw.items():
         if len(out) >= MAX_META_KEYS:
             break
-        if not isinstance(key, str):
-            continue
+        if not isinstance(key, str) or key in PRIVATE_META_KEYS:
+            continue  # an older client's absolute path, account or hostname
         if isinstance(value, bool) or isinstance(value, (int, float)):
             out[key[:MAX_META_VALUE]] = value
         elif isinstance(value, str):

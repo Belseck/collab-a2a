@@ -312,7 +312,22 @@ class Store:
             # nothing and every migrated session stays on the rollback journal.
             self._db.execute("PRAGMA journal_mode=WAL")
             self._migrate()
+            self._scrub_private_identity()
             self._db.commit()
+
+    def _scrub_private_identity(self) -> None:
+        """Remove what older clients stored that names a person: the absolute
+        working path, the hostname and the OS account. Idempotent and cheap:
+        only rows still carrying one are rewritten."""
+        if "meta" in self._columns("participants"):
+            self._db.execute(
+                "UPDATE participants SET meta=json_remove(meta, '$.cwd', '$.machine', '$.user') "
+                "WHERE json_valid(meta) AND (json_type(meta, '$.cwd') IS NOT NULL "
+                "OR json_type(meta, '$.machine') IS NOT NULL OR json_type(meta, '$.user') IS NOT NULL)")
+        self._db.execute(
+            "UPDATE events SET payload=json_remove(payload, '$.body.cwd', '$.body.machine', '$.body.user') "
+            "WHERE json_valid(payload) AND (json_type(payload, '$.body.cwd') IS NOT NULL "
+            "OR json_type(payload, '$.body.machine') IS NOT NULL OR json_type(payload, '$.body.user') IS NOT NULL)")
 
     def _columns(self, table: str) -> set[str]:
         return {row["name"] for row in self._db.execute(f"PRAGMA table_info({table})")}

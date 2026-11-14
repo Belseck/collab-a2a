@@ -110,8 +110,17 @@ def machine_id() -> str:
     return "m_" + digest[:16]
 
 
+def public_identity() -> dict[str, str]:
+    """What the hub, and through it every peer, may learn about where we run.
+
+    Only the hashed machine_id ("same box as me"). The OS account and the
+    hostname often carry a person's name, so they stay on this machine.
+    """
+    return {"machine_id": machine_id()}
+
+
 def identity() -> dict[str, str]:
-    """What we tell the hub about where this agent is running."""
+    """Where this agent runs, for LOCAL use only (registry and local display)."""
     return {
         "machine": machine_name(),
         "machine_id": machine_id(),

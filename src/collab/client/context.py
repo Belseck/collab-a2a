@@ -27,7 +27,9 @@ def gather(focus: str = "", cwd: Path | None = None) -> dict[str, Any]:
     cwd = cwd or Path.cwd()
     repo_root = _git("rev-parse", "--show-toplevel", cwd=cwd)
     remote = _git("remote", "get-url", "origin", cwd=cwd)
-    hello: dict[str, Any] = {"focus": focus.strip(), "cwd": str(cwd)}
+    # No absolute path: it names the OS account or the person (/home/NAME/…).
+    # The repo name and branch below say where the work is.
+    hello: dict[str, Any] = {"focus": focus.strip()}
 
     if repo_root:
         hello["repo"] = Path(repo_root).name

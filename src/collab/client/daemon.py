@@ -984,7 +984,7 @@ class Daemon:
         worker_usage = metrics(self.profile.dir)
         if worker_usage is not None:
             figures = {**figures, "worker": worker_usage}
-        payload = {**peers.identity(), "stats": figures}
+        payload = {**peers.public_identity(), "stats": figures}
         if sharing_skills:
             self._skills_withdrawn = False
             payload["skills"] = await self._installed_skills()
