@@ -664,3 +664,26 @@ async def test_remote_offer_is_excluded_from_worker_model_input(conversation, tm
     assert len(calls) == 1
     assert 'UNAPPROVED_SENTINEL' not in json.dumps(calls[0])
     assert calls[0]['events'][0]['text'] == 'Ordinary coordination'
+
+
+@pytest.mark.asyncio
+async def test_a_rate_limited_provider_waits_and_an_auth_failure_escalates_once(conversation, tmp_path, monkeypatch):
+    from collab import worker_runtime
+    configure(conversation, tmp_path)
+    store = worker.Store(conversation.root)
+    failures = [("rate_limit", 0.0), ("auth", 0.0), ("auth", 0.0)]
+    async def run(*args, **kwargs):
+        kind, wait = failures.pop(0)
+        raise worker_runtime.WorkerRuntimeError(f"Worker provider exited with status 1 ({kind})",
+                                                kind=kind, retry_after=wait)
+    monkeypatch.setattr("collab.worker_runtime.run_turn", run)
+    incoming(conversation, 1, "Question")
+    import time as _time
+    start = _time.time()
+    await conversation.turn()
+    assert conversation.next_at - start >= 900, "rate limit waits for the window"
+    assert "(rate_limit)" in store.status()["error"]
+    for _ in range(2):
+        conversation.next_at = 0
+        await conversation.turn()
+    assert [p["once"] for p in store.pending()] == ["provider-auth"], "escalated once, not per retry"

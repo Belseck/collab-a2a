@@ -388,3 +388,12 @@ def test_an_old_decision_about_a_peer_does_not_hide_a_new_promise_to_them():
     old = [{"seq": 2, "sender": "bob", "question": "old"}]
     assert [e["seq"] for e in unrouted_deferrals(result, selected, pending=old)] == [9], \
         "an unrelated pending decision and another peer's unanchored escalation route nothing for bob"
+
+
+def test_provider_exits_are_classified_without_keeping_their_text():
+    from collab.worker_runtime import classify_exit
+    assert classify_exit(b"Error: 429 Too Many Requests. Please retry after 120 seconds") == ("rate_limit", 120.0)
+    assert classify_exit(b"Invalid API key. Please run /login")[0] == "auth"
+    assert classify_exit(b"model claude-x not found")[0] == "model"
+    assert classify_exit(b"connect ECONNREFUSED 127.0.0.1:443")[0] == "network"
+    assert classify_exit(b"segfault")[0] == "other"
