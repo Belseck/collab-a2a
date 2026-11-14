@@ -13,6 +13,13 @@ from collab.client.worker_service import Conversation
 from collab.protocol import Envelope
 
 
+
+@pytest.fixture(autouse=True)
+def workers_allowed(monkeypatch):
+    """These drive the worker service with fake providers; conftest's
+    COLLAB_NO_WORKER (no real spend in tests) would keep it idle."""
+    monkeypatch.delenv("COLLAB_NO_WORKER", raising=False)
+
 @pytest.fixture
 def conversation(tmp_path):
     inbox = Inbox(tmp_path)
@@ -352,8 +359,9 @@ def test_worker_wake_prompt_is_a_decision_notice_not_a_standing_reminder(tmp_pat
 
 
 @pytest.mark.parametrize('agent', ['codex', 'claude'])
-async def test_idle_health_keeps_a_missing_default_model_visible_until_corrected(conversation, agent):
+async def test_idle_health_keeps_a_missing_default_model_visible_until_corrected(conversation, agent, monkeypatch):
     """The first idle tick must not hide a configuration error from onboarding."""
+    monkeypatch.delenv('COLLAB_NO_WORKER', raising=False)  # tests automatic setup
     from collab import runtime_settings
     runtime_settings.set_value('worker_agent', agent)
     runtime_settings.set_value('worker_' + agent + '_model', '')
@@ -437,3 +445,232 @@ async def test_an_empty_poll_does_not_delay_the_next_peer_question(conversation,
         incoming(service, 2, 'Another question')
         await service.tick()
         assert len(calls) == 1, 'real model calls still obey their configured gap'
+
+
+@pytest.mark.asyncio
+async def test_main_send_is_delivered_while_a_model_turn_is_in_flight(conversation, tmp_path, monkeypatch):
+    """R3: a slow provider turn must not hold the main agent's queued message."""
+    service = conversation
+    configure(service, tmp_path)
+    store = worker.Store(service.root)
+    release = asyncio.Event()
+    async def slow(*args, **kwargs):
+        await release.wait()
+        return {"summary": "", "replies": [], "escalations": []}
+    monkeypatch.setattr("collab.worker_runtime.run_turn", slow)
+    sent = []
+    async def transport(request):
+        sent.append(json.loads(request.content))
+        return httpx.Response(200, json={"seq": 9})
+    async with httpx.AsyncClient(transport=httpx.MockTransport(transport)) as client:
+        service.daemon._http = client
+        incoming(service, 1, "Question")
+        await service.tick()  # starts the slow turn
+        await asyncio.sleep(0)
+        assert service.task is not None and not service.task.done()
+        store.send("main handoff", to="", room="general", thread="t1")
+        await service.tick()
+        await asyncio.wait_for(service.delivery, 2)
+        assert [(m["text"], m["room"], m["thread"]) for m in sent] == [("main handoff", "general", "t1")]
+        assert not store.outbox()
+        release.set()
+        await asyncio.wait_for(service.task, 2)
+        assert len(sent) == 1, "the finished turn must not post the record again"
+
+
+@pytest.mark.asyncio
+async def test_a_daemon_with_collab_no_worker_runs_no_worker_at_all(conversation, monkeypatch):
+    """The env reaches the daemon through spawn; even an enabled worker.db stays idle."""
+    monkeypatch.delenv('COLLAB_NO_WORKER', raising=False)
+    store = worker.Store(conversation.root)
+    store.configure({'agent': 'claude', 'scope': 'Coordinate'})
+    monkeypatch.setenv('COLLAB_NO_WORKER', '1')
+    calls = []
+    monkeypatch.setattr("collab.worker_runtime.run_turn", lambda *a, **k: calls.append(a))
+    incoming(conversation, 1, "Question")
+    conversation.daemon._http = object()
+    await conversation.tick()
+    assert conversation.task is None and calls == []
+
+
+@pytest.mark.asyncio
+async def test_a_send_the_hub_refuses_for_good_is_dropped_and_escalated(conversation, tmp_path):
+    """A rejected address used to retry forever and fill MAX_PENDING."""
+    configure(conversation, tmp_path)
+    store = worker.Store(conversation.root)
+    store.send("for nobody", to="ghost")
+    async def transport(request):
+        return httpx.Response(404, json={"detail": "no such participant"})
+    async with httpx.AsyncClient(transport=httpx.MockTransport(transport)) as client:
+        conversation.daemon._http = client
+        await conversation._flush(store, store.snapshot()["generation"])
+    assert not store.outbox()
+    assert "@ghost could not be delivered (hub answered 404)" in store.pending()[0]["question"]
+
+
+@pytest.mark.asyncio
+async def test_two_concurrent_flushes_post_each_record_once(conversation, tmp_path):
+    configure(conversation, tmp_path)
+    store = worker.Store(conversation.root)
+    store.send("once", to="bob")
+    sent = []
+    async def transport(request):
+        sent.append(json.loads(request.content))
+        await asyncio.sleep(0.05)
+        return httpx.Response(200, json={"seq": 1})
+    async with httpx.AsyncClient(transport=httpx.MockTransport(transport)) as client:
+        conversation.daemon._http = client
+        generation = store.snapshot()["generation"]
+        await asyncio.gather(conversation._flush(store, generation), conversation._flush(store, generation))
+    assert len(sent) == 1
+
+
+@pytest.mark.asyncio
+async def test_board_comments_ride_the_outbox_in_order_with_chat(conversation, tmp_path):
+    configure(conversation, tmp_path)
+    store = worker.Store(conversation.root)
+    store.send("first", to="bob")
+    store.queue_comment("task", "T_1", "evidence: tests pass")
+    seen = []
+    async def transport(request):
+        seen.append((request.url.path.rsplit("/", 1)[-1], json.loads(request.content)))
+        return httpx.Response(200, json={})
+    async with httpx.AsyncClient(transport=httpx.MockTransport(transport)) as client:
+        conversation.daemon._http = client
+        await conversation._flush(store, store.snapshot()["generation"])
+    assert [route for route, _ in seen] == ["messages", "comments"]
+    comment = seen[1][1]
+    assert comment["subject"] == "task" and comment["id"] == "T_1" and comment["collab_worker_delivery"]
+    assert not store.outbox()
+
+
+
+@pytest.mark.asyncio
+async def test_a_queued_file_is_uploaded_and_its_copy_removed(conversation, tmp_path):
+    configure(conversation, tmp_path)
+    store = worker.Store(conversation.root)
+    source = tmp_path / "r.txt"
+    source.write_text("data")
+    store.queue_file(source, to="bob")
+    stash = store.outbox()[0]["stash"]
+    seen = []
+    async def transport(request):
+        seen.append((request.url.path.rsplit("/", 1)[-1], request.url.params.get("to")))
+        return httpx.Response(200, json={"id": "f_1"})
+    async with httpx.AsyncClient(transport=httpx.MockTransport(transport)) as client:
+        conversation.daemon._http = client
+        await conversation._flush(store, store.snapshot()["generation"])
+    assert seen == [("files", "bob")] and not store.outbox()
+    from pathlib import Path
+    assert not Path(stash).exists()
+
+
+@pytest.mark.asyncio
+async def test_under_collab_no_worker_queued_messages_are_still_delivered(conversation, tmp_path, monkeypatch):
+    configure(conversation, tmp_path)
+    store = worker.Store(conversation.root)
+    store.send("ship it", to="bob")
+    monkeypatch.setenv("COLLAB_NO_WORKER", "1")
+    calls = []
+    monkeypatch.setattr("collab.worker_runtime.run_turn", lambda *a, **k: calls.append(a))
+    sent = []
+    async def transport(request):
+        sent.append(json.loads(request.content)["text"])
+        return httpx.Response(200, json={"seq": 1})
+    async with httpx.AsyncClient(transport=httpx.MockTransport(transport)) as client:
+        conversation.daemon._http = client
+        incoming(conversation, 1, "Question")
+        await conversation.tick()
+        await asyncio.wait_for(conversation.delivery, 2)
+    assert sent == ["ship it"] and calls == [], "delivered, but no model call"
+
+
+@pytest.mark.asyncio
+async def test_daemon_upload_sends_the_delivery_key_refuses_changed_bytes_and_has_a_deadline(conversation, tmp_path):
+    import asyncio
+    import hashlib
+    stash = tmp_path / "s.bin"
+    stash.write_bytes(b"abc")
+    sent = []
+    class Http:
+        async def post(self, url, **kw):
+            sent.append(kw["params"])
+            return SimpleNamespace(status_code=200)
+    conversation.daemon._http = Http()
+    message = {"id": "o_9", "stash": str(stash), "name": "s.bin", "to": "bob",
+               "sha256": hashlib.sha256(b"abc").hexdigest()}
+    assert await conversation._upload(message, timeout=5) == 200
+    assert sent[0]["delivery"] == "o_9"
+    stash.write_bytes(b"changed")
+    assert await conversation._upload(message, timeout=5) == 422 and len(sent) == 1
+    stash.write_bytes(b"abc")
+    class Slow:
+        async def post(self, url, **kw):
+            await asyncio.sleep(10)
+    conversation.daemon._http = Slow()
+    with pytest.raises(asyncio.TimeoutError):
+        await conversation._upload(message, timeout=0.05)
+
+
+
+@pytest.mark.asyncio
+async def test_no_worker_daemon_holds_a_queue_that_worker_off_holds(conversation, tmp_path, monkeypatch):
+    """M21: under COLLAB_NO_WORKER, a disabled worker's outbox is not flushed."""
+    configure(conversation, tmp_path)
+    store = worker.Store(conversation.root)
+    store.send("held", to="bob")
+    cfg = store.configuration()
+    store.configure({**cfg, "enabled": False})
+    monkeypatch.setenv("COLLAB_NO_WORKER", "1")
+    conversation.daemon._http = object()
+    await conversation.tick()
+    assert conversation.delivery is None
+
+
+async def test_a_rate_limited_provider_waits_and_an_auth_failure_escalates_once(conversation, tmp_path, monkeypatch):
+    from collab import worker_runtime
+    configure(conversation, tmp_path)
+    store = worker.Store(conversation.root)
+    failures = [("rate_limit", 0.0), ("auth", 0.0), ("auth", 0.0)]
+    async def run(*args, **kwargs):
+        kind, wait = failures.pop(0)
+        raise worker_runtime.WorkerRuntimeError(f"Worker provider exited with status 1 ({kind})",
+                                                kind=kind, retry_after=wait)
+    monkeypatch.setattr("collab.worker_runtime.run_turn", run)
+    incoming(conversation, 1, "Question")
+    import time as _time
+    start = _time.time()
+    await conversation.turn()
+    assert conversation.next_at - start >= 900, "rate limit waits for the window"
+    assert "(rate_limit)" in store.status()["error"]
+    for _ in range(2):
+        conversation.next_at = 0
+        await conversation.turn()
+    assert [p["once"].split("@")[0] for p in store.pending()] == ["provider-auth"], "escalated once, not per retry"
+
+
+
+@pytest.mark.asyncio
+async def test_an_escalation_naming_a_message_outside_the_turn_keeps_its_question(conversation, tmp_path, monkeypatch):
+    configure(conversation, tmp_path)
+    async def run(*args, **kwargs):
+        return {"summary": "", "replies": [], "escalations": [
+            {"reason": "decision", "seq": 999, "question": "Which branch?"}]}
+    monkeypatch.setattr("collab.worker_runtime.run_turn", run)
+    incoming(conversation, 1, "Question")
+    await conversation.turn()
+    store = worker.Store(conversation.root)
+    assert [(p["seq"], p["question"]) for p in store.pending()] == [(0, "Which branch?")], "unanchored, never guessed"
+    assert not store.status()["error"]
+
+
+
+def test_provider_backoff_table():
+    from collab.client.worker_service import provider_backoff
+    base = 30.0
+    assert provider_backoff("rate_limit", 0, base) == 900.0
+    assert provider_backoff("rate_limit", 3600, base) == 3600.0
+    assert provider_backoff("auth", 0, base) == 3600.0
+    assert provider_backoff("model", 5, base) == 3600.0
+    assert provider_backoff("network", 3600, base) == base, "a stated wait is ignored for network"
+    assert provider_backoff("other", 3600, base) == base, "and for other"

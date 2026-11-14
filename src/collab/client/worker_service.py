@@ -9,8 +9,10 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import logging
 import json
 import time
+from pathlib import Path
 
 from .. import activity, worker, worker_runtime
 from ..runtime_settings import get as setting
@@ -23,6 +25,8 @@ TURN_GAP = 5.0
 PAGE_SIZE = 24
 MAX_EVENTS_BYTES = 64_000
 
+
+logger = logging.getLogger(__name__)
 
 def _excerpt(text, budget):
     """Bound a displayed field by its JSON cost, including escaped controls."""
@@ -74,6 +78,17 @@ def skill_requests(events, escalations, me: str, me_id: str = "") -> list[dict]:
     return added
 
 
+def provider_backoff(kind: str, said: float, base: float) -> float:
+    """Seconds before the next model call, by why the provider failed."""
+    if kind == "rate_limit":
+        return max(said, 900.0)   # wait for the window, not every 30 s
+    if kind in ("auth", "model"):
+        return 3600.0             # escalated; retry rarely in case it was fixed
+    # A stated wait outside a rate limit is untrusted text (stderr may echo
+    # the prompt, i.e. peer words): it never stretches the back-off.
+    return base
+
+
 class Conversation:
     def __init__(self, daemon):
         self.daemon = daemon
@@ -82,11 +97,20 @@ class Conversation:
         self.next_at = 0.0
         self.generation = None
         self.policy = None
+        # The main agent's queued sends must not wait behind a model turn,
+        # and two flushes must never post the same outbox record twice.
+        self.delivery: asyncio.Task | None = None
+        self.flushing = asyncio.Lock()
 
     def configured(self) -> bool:
         return (self.root / "worker.db").exists()
 
     async def stop(self) -> None:
+        if self.delivery is not None:
+            self.delivery.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await self.delivery
+            self.delivery = None
         if self.task is not None:
             self.task.cancel()
             with contextlib.suppress(asyncio.CancelledError, Exception):
@@ -105,6 +129,16 @@ class Conversation:
         state = store.snapshot()
         cfg = state["config"]
         generation = state["generation"]
+        if worker.no_worker():
+            # A daemon told to have no worker runs no model, whatever worker.db
+            # says (the variable is inherited through spawn). Anything already
+            # queued is still delivered: stranding it would lose messages.
+            # `worker off` holds its queue, so only an enabled worker's is sent.
+            if ((cfg or {}).get("enabled") and self.daemon._http is not None
+                    and (self.delivery is None or self.delivery.done())
+                    and any(r.get("retry_at", 0) <= time.time() for r in store.outbox())):
+                self.delivery = asyncio.create_task(self._flush_outbox_only(store, generation))
+            return
         if not cfg or not cfg.get("enabled") or generation != self.generation:
             await self.stop()
             self.generation = generation
@@ -113,6 +147,17 @@ class Conversation:
                 return
         if self.task is not None:
             if not self.task.done():
+                if self.delivery is not None and self.delivery.done():
+                    # _flush defers its own failures; anything else is logged
+                    # here rather than left as an unretrieved task exception.
+                    with contextlib.suppress(asyncio.CancelledError):
+                        if self.delivery.exception() is not None:
+                            logger.warning("worker delivery failed: %s",
+                                           type(self.delivery.exception()).__name__)
+                    self.delivery = None
+                if (self.delivery is None and self.daemon._http is not None
+                        and any(row.get("retry_at", 0) <= time.time() for row in store.outbox())):
+                    self.delivery = asyncio.create_task(self._flush(store, generation))
                 return
             # turn() records failures; retrieving the result prevents a silent
             # task exception if the database itself became unavailable.
@@ -145,13 +190,22 @@ class Conversation:
         if not current["error"] or current["error"].startswith("Worker replies are awaiting delivery"):
             self._delivery_health(store, generation)
 
+    async def _flush_outbox_only(self, store, generation) -> None:
+        async with self.flushing:
+            await self._flush_locked(store, generation, require_enabled=False)
+
     async def _flush(self, store, generation) -> None:
+        async with self.flushing:
+            await self._flush_locked(store, generation)
+
+    async def _flush_locked(self, store, generation, *, require_enabled: bool = True) -> None:
         attempts = 0
         for message in store.outbox():
             if message.get("retry_at", 0) > time.time():
                 continue
             current = store.snapshot()
-            if current["generation"] != generation or not (current["config"] or {}).get("enabled"):
+            if require_enabled and (current["generation"] != generation
+                                    or not (current["config"] or {}).get("enabled")):
                 return
             attempts += 1
             try:
@@ -160,18 +214,41 @@ class Conversation:
                 # response field was used. Close the stream after its headers;
                 # a total deadline also bounds slow trickles, not only silence.
                 timeout = setting("worker_delivery_timeout")
+                if message.get("kind") == "file":
+                    status = await self._upload(message, timeout=setting("worker_delivery_timeout") * 8)
+                    if 400 <= status < 500 and status not in (401, 408, 425, 429):
+                        store.reject(message["id"], reason=f"hub answered {status}")
+                    elif status >= 400:
+                        raise RuntimeError(f"upload answered {status}")
+                    else:
+                        store.acknowledge(message["id"])
+                    if attempts >= setting("worker_delivery_batch"):
+                        break
+                    continue
+                if message.get("kind") == "comment":
+                    route, payload = "comments", {
+                        "subject": message["subject"], "id": message["subject_id"],
+                        "text": message["text"], "collab_worker_delivery": message["id"]}
+                else:
+                    route, payload = "messages", {
+                        "kind": "chat", "text": message["text"],
+                        "to": message.get("to") or None,
+                        "room": message.get("room") or None,
+                        "thread": message.get("thread") or None,
+                        "body": {**(message.get("body") or {}),
+                                 "collab_worker_delivery": message["id"]}}
                 async def acknowledge():
                     async with self.daemon._http.stream(
-                        "POST", f"{self.daemon.profile.url}{EXT_PREFIX}/messages",
+                        "POST", f"{self.daemon.profile.url}{EXT_PREFIX}/{route}",
                         headers=request_headers(self.daemon.profile.token),
-                        json={"kind": "chat", "text": message["text"],
-                              "to": message.get("to") or None,
-                              "room": message.get("room") or None,
-                              "body": {"collab_worker_delivery": message["id"]}}, timeout=timeout) as response:
+                        json=payload, timeout=timeout) as response:
+                        if 400 <= response.status_code < 500 and response.status_code not in (401, 408, 425, 429):
+                            store.reject(message["id"], reason=f"hub answered {response.status_code}")
+                            return
                         response.raise_for_status()
                 # wait_for retains the total deadline on supported Python 3.10.
                 await asyncio.wait_for(acknowledge(), timeout=timeout)
-                store.acknowledge(message["id"])
+                store.acknowledge(message["id"])  # no-op after a reject
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -181,6 +258,30 @@ class Conversation:
                             error=type(exc).__name__)
             if attempts >= setting("worker_delivery_batch"):
                 break
+
+    async def _upload(self, message, *, timeout) -> int:
+        """Upload a queued file's private copy; the HTTP status decides its fate."""
+        import hashlib
+        stash = Path(message["stash"])
+
+        def read() -> bytes | None:
+            data = stash.read_bytes()
+            return data if hashlib.sha256(data).hexdigest() == message.get("sha256") else None
+
+        async def send() -> int:
+            # Up to 10 MB read and hashed off the event loop, under the same deadline.
+            data = await asyncio.to_thread(read)
+            if data is None:
+                return 422  # the private copy changed: never send different bytes
+            params = {k: message[k] for k in ("to", "room") if message.get(k)}
+            params["delivery"] = message["id"]  # the hub stores a retried upload once
+            response = await self.daemon._http.post(
+                f"{self.daemon.profile.url}{EXT_PREFIX}/files",
+                headers=request_headers(self.daemon.profile.token), params=params,
+                files={"file": (message["name"], data, "application/octet-stream")}, timeout=timeout)
+            return response.status_code
+
+        return await asyncio.wait_for(send(), timeout=timeout)
 
     def _source(self, record):
         """A compact summary cannot be trusted to remember a reply address."""
@@ -319,7 +420,9 @@ class Conversation:
             # An empty poll used to spend the same cooldown as a paid turn,
             # making the next real question wait up to two daemon heartbeats.
             # Charge the configurable gap only when a model call is reserved.
-            self.next_at = time.time() + setting("worker_turn_gap")
+            self.next_at = time.time() + worker.pace(
+                store.budget(limit=setting("worker_max_attempts"), window=setting("worker_budget_window")),
+                limit=setting("worker_max_attempts"), gap=setting("worker_turn_gap"))
             store.health(running=True, expected_generation=snapshot["generation"])
             result = await worker_runtime.run_turn(
                 cfg["agent"], (setting(f"worker_{cfg['agent']}_model") if cfg.get("model_default") else cfg.get("model", "")), payload, self.root / "worker-runtime",
@@ -329,8 +432,12 @@ class Conversation:
             known.update(a["source"]["sender"] for a in answers if "source" in a)
             valid_seqs = {0, *(e["seq"] for e in selected),
                           *(a["source"]["seq"] for a in answers if "source" in a)}
-            if any(e["seq"] not in valid_seqs for e in result["escalations"]):
-                raise worker_runtime.WorkerRuntimeError("Worker referred to a message outside this turn")
+            # A wrong seq used to throw the whole paid turn away and back off.
+            # Keep the question, but unanchored: guessing an anchor could show
+            # the human one peer's text and route the answer to another.
+            for escalation in result["escalations"]:
+                if escalation["seq"] not in valid_seqs:
+                    escalation["seq"] = 0
             for reply in result["replies"]:
                 if reply["to"] and reply["to"] not in known:
                     raise ValueError("worker proposed an unknown recipient")
@@ -340,11 +447,15 @@ class Conversation:
                 rooms.add("general")
                 if reply["room"] and reply["room"] not in rooms:
                     raise ValueError("worker proposed an unknown room")
+            escalations = result["escalations"] + worker_runtime.unrouted_deferrals(
+                result, selected, store.pending(),
+                answered={a["source"]["sender"]: int(a["source"].get("seq") or 0)
+                          for a in answers if a.get("source", {}).get("sender")})
             committed = store.commit_turn(
                 expected_cursor=snapshot["cursor"], cursor=cursor,
                 summary=result["summary"], replies=result["replies"],
-                escalations=result["escalations"] + skill_requests(
-                    [e for e in events if e.seq <= cursor], result["escalations"],
+                escalations=escalations + skill_requests(
+                    [e for e in events if e.seq <= cursor], escalations,
                     self.daemon.profile.name, self.daemon.profile.participant_id),
                 context_ids=[row["id"] for row in contexts],
                 answer_ids=[row["id"] for row in answers],
@@ -360,5 +471,16 @@ class Conversation:
             # Exception details can include a bearer URL or provider output;
             # status needs a class of failure, not private subprocess logs.
             detail = str(exc) if isinstance(exc, worker_runtime.WorkerRuntimeError) else type(exc).__name__
-            self.next_at = time.time() + setting("worker_retry_delay")
+            kind = getattr(exc, "kind", "")
+            if kind and kind != "other":
+                detail = f"{detail} ({kind.replace('_', ' ')})"
+            self.next_at = time.time() + provider_backoff(kind, getattr(exc, "retry_after", 0.0),
+                                                          setting("worker_retry_delay"))
+            if kind in ("auth", "model"):
+                # Retrying cannot fix these; the main agent (and its human) can.
+                store.escalate_once(f"provider-{kind}", (
+                    "Your conversation worker's provider failed with an "
+                    + ("authentication" if kind == "auth" else "model") + " error; it will not "
+                    "recover by retrying. Check `collab worker status`, the provider CLI's login, "
+                    "or the configured model."), expected_generation=snapshot["generation"])
             store.health(error=detail[:300], retry_at=self.next_at, running=False, expected_generation=snapshot["generation"])

@@ -304,3 +304,138 @@ def test_claude_stream_diagnostics_do_not_discard_valid_actions():
     assert runtime._decode('claude', b'Warning: optional config missing\n' + result, None) == GOOD
     with pytest.raises(runtime.WorkerRuntimeError):
         runtime._decode('claude', result + b'\n{"type":"result","type":"result"}', None)
+
+
+def test_a_deferring_reply_without_an_escalation_is_routed_to_the_main_agent():
+    """Observed live: 'hold tight, I'll get back to you' with nothing filed."""
+    from collab.worker_runtime import unrouted_deferrals
+    selected = [{"seq": 7, "sender": "cortana", "text": "Which task should I claim?"}]
+    result = {"replies": [{"text": "Hold tight, I'll get back to you.", "to": "cortana", "room": ""}],
+              "escalations": []}
+    added = unrouted_deferrals(result, selected, pending=[])
+    assert [(e["reason"], e["seq"]) for e in added] == [("decision", 7)]
+    assert "Which task should I claim?" in added[0]["question"]
+    assert unrouted_deferrals(result, selected, pending=[{"seq": 7}]) == []
+    routed = {**result, "escalations": [{"reason": "decision", "seq": 7, "question": "q"}]}
+    assert unrouted_deferrals(routed, selected, pending=[]) == []
+    plain = {"replies": [{"text": "R3 is claimed by cortana.", "to": "cortana", "room": ""}],
+             "escalations": []}
+    assert unrouted_deferrals(plain, selected, pending=[]) == []
+
+
+def test_deferral_repair_covers_curly_apostrophes_and_each_peer_separately():
+    from collab.worker_runtime import unrouted_deferrals
+    selected = [{"seq": 3, "sender": "ana", "room": "", "text": "Merge now?"},
+                {"seq": 4, "sender": "bo", "room": "", "text": "Which port?"}]
+    result = {"replies": [{"text": "I\u2019ll check and confirm.", "to": "bo", "room": ""},
+                          {"text": "Asked my human.", "to": "ana", "room": ""}],
+              "escalations": [{"reason": "decision", "seq": 3, "question": "Merge?"}]}
+    added = unrouted_deferrals(result, selected, pending=[])
+    assert [e["seq"] for e in added] == [4], "ana's escalation must not hide bo's promise"
+
+
+def test_relaying_the_main_answer_and_quoting_other_dms_are_not_repaired():
+    from collab.worker_runtime import unrouted_deferrals
+    selected = [{"seq": 2, "sender": "carol", "to": "alice", "room": "", "text": "private to alice"}]
+    answer = "Hold tight, I'll get back to you after the deploy."
+    relayed = {"replies": [{"text": answer, "to": "bob", "room": ""}], "escalations": []}
+    assert unrouted_deferrals(relayed, selected, pending=[], answered={"bob": 1}) == []
+    paraphrased = {"replies": [{"text": "Hold tight — the deploy answer is coming.", "to": "bob", "room": ""}],
+                   "escalations": []}
+    assert unrouted_deferrals(paraphrased, selected, pending=[], answered={"bob": 1}) == []
+    # bob's DM thread has no message this turn; carol's private DM must not be quoted
+    stray = {"replies": [{"text": "Stand by, I'll check and confirm.", "to": "bob", "room": ""}],
+             "escalations": []}
+    assert unrouted_deferrals(stray, selected, pending=[]) == []
+
+
+def test_the_deferral_pattern_has_fewer_false_positives():
+    from collab.worker_runtime import DEFERRAL
+    assert DEFERRAL.search("Stand by.") and DEFERRAL.search("Will update you shortly")
+    assert not DEFERRAL.search("Let me check: the tests pass now")
+    assert not DEFERRAL.search("I'll check the logs")
+
+
+
+def test_an_escalation_about_a_peer_in_the_same_turn_routes_its_deferral():
+    from collab.worker_runtime import unrouted_deferrals
+    selected = [{"seq": 4, "sender": "bob", "to": "", "room": "general", "text": "Which port?"}]
+    result = {"replies": [{"text": "I'll check and confirm.", "to": "bob", "room": ""}],
+              "escalations": [{"reason": "decision", "seq": 4, "question": "Port?"}]}
+    assert unrouted_deferrals(result, selected, pending=[]) == []
+    alone = {**result, "escalations": []}
+    assert [e["seq"] for e in unrouted_deferrals(alone, selected, pending=[])] == [4]
+
+
+def test_a_new_question_from_a_peer_already_waiting_is_still_routed():
+    from collab.worker_runtime import unrouted_deferrals
+    selected = [{"seq": 7, "sender": "bob", "text": "Which branch?", "room": "general"},
+                {"seq": 9, "sender": "bob", "text": "And who reviews it?", "room": "general"}]
+    result = {"escalations": [], "replies": [
+        {"to": "bob", "room": "general", "text": "I'll check and get back to you."}]}
+    added = unrouted_deferrals(result, selected, pending=[{"seq": 7}])
+    assert [a["seq"] for a in added] == [9], "the pending decision covers seq 7 only"
+
+
+
+def test_the_answered_exemption_does_not_cover_a_newer_follow_up():
+    """M7: bob's answered question is exempt; his newer follow-up is routed."""
+    from collab.worker_runtime import unrouted_deferrals
+    selected = [{"seq": 12, "sender": "bob", "to": "", "room": "general", "text": "Also, who reviews it?"}]
+    result = {"escalations": [], "replies": [
+        {"to": "bob", "room": "general", "text": "I'll get back to you on that."}]}
+    assert unrouted_deferrals(result, selected, pending=[], answered={"bob": 12}) == []
+    assert [a["seq"] for a in unrouted_deferrals(result, selected, pending=[], answered={"bob": 5})] == [12]
+
+
+def test_provider_exits_are_classified_without_keeping_their_text():
+    from collab.worker_runtime import classify_exit
+    assert classify_exit(b"Error: 429 Too Many Requests. Please retry after 120 seconds") == ("rate_limit", 120.0)
+    assert classify_exit(b"Invalid API key. Please run /login")[0] == "auth"
+    assert classify_exit(b"model claude-x not found")[0] == "model"
+    assert classify_exit(b"connect ECONNREFUSED 127.0.0.1:443")[0] == "network"
+    assert classify_exit(b"segfault")[0] == "other"
+
+
+
+def test_exit_patterns_do_not_misfire_and_waits_are_capped():
+    from collab.worker_runtime import MAX_PROVIDER_WAIT, classify_exit
+    assert classify_exit(b"processed 14290 tokens; done")[0] == "other"
+    assert classify_exit(b"error at line 512 of config")[0] == "other"
+    assert classify_exit(b"HTTP 503 Service Unavailable")[0] == "network"
+    assert classify_exit(b"429 Too Many Requests, retry after 2 hours") == ("rate_limit", MAX_PROVIDER_WAIT)
+    assert classify_exit(b"rate limited; try again in 30 min") == ("rate_limit", 1800.0)
+
+
+def test_a_new_configuration_may_escalate_the_same_failure_again(tmp_path):
+    from collab import worker
+    store = worker.Store(tmp_path)
+    store.configure({"agent": "claude", "scope": "Coordinate"})
+    g1 = store.snapshot()["generation"]
+    store.escalate_once("provider-auth", "fix login", expected_generation=g1)
+    store.escalate_once("provider-auth", "fix login", expected_generation=g1)
+    store.configure({"agent": "claude", "scope": "Coordinate"})
+    g2 = store.snapshot()["generation"]
+    store.escalate_once("provider-auth", "fix login", expected_generation=g1)   # stale turn: ignored
+    store.escalate_once("provider-auth", "fix login", expected_generation=g2)
+    assert sorted(p["once"] for p in store.pending()) == [f"provider-auth@{g1}", f"provider-auth@{g2}"]
+
+
+
+def test_ordinary_words_containing_log_in_are_not_auth_failures():
+    from collab.worker_runtime import classify_exit
+    for text in (b"rebuilding catalog index", b"closing the dialog in 3 s", b"login.py:12 SyntaxError"):
+        assert classify_exit(text)[0] != "auth", text
+    assert classify_exit(b"Not logged in. Please run /login")[0] == "auth"
+
+
+
+def test_answering_the_failure_decision_lets_the_next_failure_escalate(tmp_path):
+    from collab import worker
+    store = worker.Store(tmp_path)
+    store.configure({"agent": "claude", "scope": "Coordinate"})
+    g = store.snapshot()["generation"]
+    store.escalate_once("provider-auth", "fix login", expected_generation=g)
+    store.answer(store.pending()[0]["id"], "logged in again")
+    store.escalate_once("provider-auth", "fix login", expected_generation=g)
+    assert len(store.pending()) == 1

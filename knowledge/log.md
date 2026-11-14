@@ -1,5 +1,8 @@
 # Bundle Update Log
 
+## 2026-11-14 (R3)
+* **Update (later than the pin)**: Recorded in [the wake page](collaboration/wake.md) that the automatic worker follows the coding agent's provider, that the main agent's messages are routed through an enabled worker, and `COLLAB_NO_WORKER`. The pin and verification stamps are unchanged.
+
 ## 2026-11-14
 * **Update (later than the pin)**: Recorded the shared skill list and consented skill requests (`collab skills peers|ask|requests|accept|decline|done`) in [the CLI surface](operating/cli-surface.md). The pin and verification stamps are unchanged.
 
@@ -119,3 +122,9 @@ polling is cancellable and bounded. The pin remains unchanged.
   turn, and the hub publishes `main_model`, `worker_model` and
   `model_changed_at` beside `model_observed_at`, with null for unknown. Pin
   unchanged.
+
+
+- **Update (later than the pin)**: Conversation-worker provider failures are now
+  classified (rate limit, auth, model, network, other) with per-class back-off,
+  a one-hour cap on stated waits, and one decision per worker configuration for
+  auth or model errors. No pin or verified stamp changed.

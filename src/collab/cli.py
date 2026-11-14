@@ -1378,6 +1378,38 @@ def cmd_send(args: argparse.Namespace) -> int:
     if reason := message_refusal(text):
         fail(reason)
         return 1
+    # While a worker is enabled it is this participant's only voice in the
+    # session: a direct post would race its replies and say things it does not
+    # know. Queue the exact text on its durable outbox instead of refusing.
+    from .worker import Store
+    store = Store(profile.dir)
+    if store.enabled():
+        if args.to:
+            # A direct post failed at once on an unknown name; a queued one
+            # would retry forever. Ask the hub first; offline still queues.
+            try:
+                with _client(profile) as client:
+                    names = {p.get("name") for p in client.participants().get("participants", [])}
+                if names and args.to not in names:
+                    fail(f"no participant named {args.to!r} in this session")
+                    return 1
+            except HubError:
+                pass
+        try:
+            record_id = store.send(text, to=args.to or "",
+                                   room="" if args.to else (args.room or profile.room or ""),
+                                   thread=args.thread or "")
+        except ValueError as exc:
+            fail(str(exc))
+            return 1
+        try:
+            onboard.ensure_daemon(profile, wait=False)
+        except (OSError, RuntimeError, HubError):
+            pass  # queued durably; the listener delivers it when it is back
+        target = f"@{args.to}" if args.to else f"#{args.room or profile.room}"
+        ok(f"queued for {target} through your worker: {record_id}")
+        print(dim("  your worker is enabled, so it delivers what you send; `collab worker status` shows delivery"))
+        return 0
     env = Envelope(
         kind=KIND_CHAT, text=text, sender=profile.name,
         room=None if args.to else (args.room or profile.room),
@@ -2115,6 +2147,8 @@ def cmd_task(args: argparse.Namespace) -> int:
                     fail("`collab task comment --id T_xxx \"what you want to"
                          " say\"`")
                     return 1
+                if (queued := _queue_comment(profile, "task", args.id, args.title)) is not None:
+                    return queued
                 client.add_comment("task", args.id, args.title)
                 ok(f"commented on {said(args.id)}")
                 return 0
@@ -2325,6 +2359,8 @@ def cmd_project(args: argparse.Namespace) -> int:
                     fail("`collab project comment --id P_xxx \"what you want"
                          " to say\"`")
                     return 1
+                if (queued := _queue_comment(profile, "project", args.id, args.title)) is not None:
+                    return queued
                 client.add_comment("project", args.id, args.title)
                 ok(f"commented on {said(args.id)}")
                 return 0
@@ -2622,6 +2658,128 @@ def _stat_bits(person: dict[str, Any]) -> list[str]:
         when = reported_when(stats)
         bits.append(f"reported {when} · {age}" if when else age)
     return bits
+
+
+def dashboard_rows(snapshot: dict[str, Any], skills: dict[str, Any] | None, *,
+                   live: bool = True, own_stats: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+    """Everyone's quota and skills from what the daemon already holds (R12).
+
+    Unknown stays unknown: a window nobody reported is absent, never 0%; a
+    roster that is no longer live shows nobody connected and no quota; a skill
+    list the hub cannot serve or the participant does not share says so.
+    `own_stats` fills this participant's row when it does not share stats.
+    """
+    from .stats import quota_summary
+    lists = {p.get("id") or p.get("name"): p.get("skills") or []
+             for p in (skills or {}).get("participants", []) if isinstance(p, dict)}
+    rows = []
+    for person in snapshot.get("participants") or []:
+        you = (person.get("id") == snapshot.get("you_id") if snapshot.get("you_id")
+               else person.get("name") == snapshot.get("you"))
+        stats = person.get("stats") or {}
+        if you and own_stats and not stats.get("quotas") and stats.get("quota_used_pct") is None:
+            stats = {**stats, **own_stats}
+        if not live:
+            stats = {}
+        quotas = {name: {"used_pct": w.get("used_pct"), "resets_at": w.get("resets_at")}
+                  for name, w in (stats.get("quotas") or {}).items() if isinstance(w, dict)}
+        from .config import stats_stale_after
+        from .stats import _stamp_of, reported_age
+        # The QUOTA's own observation time, not the report's: a six-hour-old
+        # window re-reported five seconds ago is six hours old.
+        from .stats import CLOCK_SKEW
+        # The OLDER of the two stamps: a peer controls quota_observed_at, and a
+        # future one must not make a 7 h-old report look fresh. A stamp beyond
+        # the clock-skew allowance ahead is unknown, so stale.
+        stamps = [t for t in (_stamp_of({"reported_at": stats.get("quota_observed_at")}), _stamp_of(stats))
+                  if t is not None]
+        quota_stamp = min(stamps) if stamps else None
+        if quota_stamp is not None and quota_stamp - time.time() > CLOCK_SKEW:
+            quota_stamp = None
+        stale = bool(stats.get("quotas") or stats.get("quota_used_pct") is not None) and (
+            quota_stamp is None or time.time() - quota_stamp > stats_stale_after())
+        quota_age = reported_age({"reported_at": quota_stamp}) if quota_stamp is not None else "age unknown"
+        model_stamp = _stamp_of({"reported_at": stats.get("model_observed_at")})
+        worker = stats.get("worker") if isinstance(stats.get("worker"), dict) else {}
+        budget = worker.get("budget_remaining")
+        count = person.get("skills_count")
+        if count is None:
+            skill_state = "unknown"  # a hub or peer older than skill lists
+        elif not count:
+            skill_state = "not shared"
+        elif skills is None:
+            skill_state = "unknown"
+        elif skills.get("unsupported"):
+            skill_state = "hub too old"
+        else:
+            skill_state = "shared"
+        listed = lists.get(person.get("id")) or lists.get(person.get("name")) or []
+        if skill_state == "shared" and not listed:
+            skill_state = "unknown"  # count changed since the lists were read
+        rows.append({"name": person.get("name", ""), "you": you,
+                     "connected": live and bool(person.get("connected")),
+                     "quota": stats.get("quota_used_pct") if not quotas else None,
+                     "quotas": quotas, "quota_summary": quota_summary(stats, with_resets=True),
+                     "quota_stale": stale, "reported": quota_age,
+                     "model_age": reported_age({"reported_at": model_stamp}) if model_stamp else "age unknown",
+                     "main_model": str(stats.get("model") or "unknown"),
+                     "worker_model": str(worker.get("model") or "unknown"),
+                     "model_observed_at": stats.get("model_observed_at"),
+                     "model_changed_at": stats.get("model_changed_at"),
+                     "worker_budget": budget if isinstance(budget, (int, float)) else None,
+                     "skills": listed if skill_state == "shared" else [],
+                     "skills_state": skill_state})
+    return rows
+
+
+def cmd_dashboard(args: argparse.Namespace) -> int:
+    """Read-only view the daemon keeps current; no hub call from here."""
+    from .stats import read_stats
+    from .runtime_settings import get as runtime_setting
+    profile = _require_profile(args)
+    paths = DaemonPaths(profile.dir)
+    try:
+        snapshot = json.loads(paths.snapshot.read_text())
+    except (OSError, ValueError):
+        fail("no roster yet; is the listener running? (`collab check`)")
+        return 1
+    try:
+        skills = json.loads(paths.skills.read_text())
+    except (OSError, ValueError):
+        skills = None
+    age = time.time() - float(snapshot.get("fetched_at") or 0)
+    live = (daemon_state(read_status(profile), running=is_running(profile) is not None) == "live"
+            and 0 <= age <= runtime_setting("participant_stale_after"))
+    own = read_stats(profile) if not share_stats_enabled() else None
+    rows = dashboard_rows(snapshot, skills, live=live, own_stats=own)
+    if args.json:
+        print(json.dumps({"fetched_at": snapshot.get("fetched_at"), "stale": not live,
+                          "skills_fetched_at": (skills or {}).get("fetched_at"),
+                          "untrusted": True, "participants": rows},
+                         indent=2, ensure_ascii=True))
+        return 0
+    note = f"roster {int(age)}s old" + ("" if live else ", not live: quota unknown")
+    if skills and skills.get("fetched_at"):
+        note += f", skill lists {int(time.time() - float(skills['fetched_at']))}s old"
+    heading(f"session dashboard  {dim(f'({note})')}")
+    for row in rows:
+        mark = c("●", "32") if row["connected"] else dim("○")
+        you = dim(" (you)") if row["you"] else ""
+        quota = said(row["quota_summary"]) if row["quota_summary"] else dim("quota unknown")
+        if row["quota_summary"] and row["quota_stale"]:
+            quota += dim(f" ({said(row['reported'])})")  # reported_age already says "old"
+        budget = ("" if row["worker_budget"] is None
+                  else f"  worker {int(row['worker_budget'])} turns left")
+        print(f"  {mark} {c(said(row['name']), '1')}{you}  {quota}{budget}")
+        print(dim(f"      models: main {said(row['main_model'])} ({said(row['model_age'])})"
+                  f" · worker {said(row['worker_model'])}"))
+        if row["skills"]:
+            names = ", ".join(said(s.get("name", "")) for s in row["skills"][:12] if isinstance(s, dict))
+            more = f" +{len(row['skills']) - 12}" if len(row["skills"]) > 12 else ""
+            print(f"      skills: {names}{more}")
+        else:
+            print(dim(f"      skills: {row['skills_state']}"))
+    return 0
 
 
 def cmd_stats(args: argparse.Namespace) -> int:
@@ -3137,12 +3295,15 @@ def cmd_resume(args: argparse.Namespace) -> int:
         fail(f"{lock.describe()} is still active; stop it before resuming another session")
         return 1
     recorded_owner = exclusive.decode(lock.owner) if lock else None
-    legacy_foreign = (lock and lock.held and not recorded_owner and lock.owner_pids
-                      and any(lockfile.process_alive(pid) for pid in lock.owner_pids)
-                      and not lock.owned_by(lockfile.ancestry()))
-    if legacy_foreign or (recorded_owner and recorded_owner.alive()
+    blocking_pid = None
+    if (lock and lock.held and not recorded_owner and lock.owner_pids
+            and not lock.owned_by(lockfile.ancestry())):
+        blocking_pid = next((pid for pid in lock.owner_pids if lockfile.process_alive(pid)), None)
+    elif (recorded_owner and recorded_owner.alive()
             and recorded_owner.pid not in lockfile.ancestry()):
-        fail(f"{lock.describe()} belongs to another live agent; refusing to take its identity; use --home for a deliberate second identity")
+        blocking_pid = recorded_owner.pid
+    if blocking_pid is not None:
+        fail(f"{lock.describe()} belongs to another live agent (blocking owner PID {blocking_pid}); refusing to take its identity; use --home for a deliberate second identity")
         return 1
     original = Path.cwd()
     old_home = os.environ.get("COLLAB_HOME")
@@ -3511,6 +3672,22 @@ def cmd_file(args: argparse.Namespace) -> int:
                     fail(f"{path.name} is {size / 1024 / 1024:.1f}MB — the limit is "
                          f"{MAX_FILE_BYTES // 1024 // 1024}MB")
                     return 1
+                from .worker import Store
+                if getattr(profile, "dir", None) and Store(profile.dir).enabled():
+                    # R3: the worker is this participant's one voice while it is on.
+                    record_id = Store(profile.dir).queue_file(
+                        path, to=args.to or "", room="" if args.to else (args.room or profile.room or "general"))
+                    try:
+                        onboard.ensure_daemon(profile, wait=False)
+                    except (OSError, RuntimeError, HubError):
+                        pass
+                    if args.json:
+                        print(json.dumps({"queued": True, "outbox_id": record_id, "name": path.name,
+                                          "size": size}, indent=2))
+                        return 0
+                    ok(f"{said(path.name)} queued for delivery by your worker: {record_id}")
+                    print(dim("  `collab worker status` shows it until it is delivered"))
+                    return 0
                 record = client.upload_file(path, to=args.to, room=args.room)
                 if args.json:
                     print(json.dumps(record, indent=2))
@@ -6033,8 +6210,50 @@ def cmd_worker(args: argparse.Namespace) -> int:
             store.configure(config)
             onboard.ensure_daemon(profile)
             ok("collaboration worker enabled; the listener owns its lifecycle")
+            from .worker import no_worker
+            if no_worker():
+                warn("COLLAB_NO_WORKER is set: a listener started from this environment runs no worker")
             print("  `collab worker status` reports provider errors and pending decisions")
         elif args.worker_action == "off":
+            # Queued main-agent sends are delivered before the worker stops:
+            # left behind, a later start posted them stale and out of order.
+            queued = store.outbox()
+            from .protocol import EXT_PREFIX as protocol_prefix
+            if queued:
+                try:
+                    with _client(profile) as client:
+                        for record in queued:
+                            if record.get("kind") == "file":
+                                import hashlib
+                                stash = Path(record["stash"])
+                                if hashlib.sha256(stash.read_bytes()).hexdigest() != record.get("sha256"):
+                                    raise HubError(f"queued file {record.get('name')!r} changed since it "
+                                                   "was queued; not sending different bytes")
+                                client.upload_file(stash, to=record.get("to") or None,
+                                                   room=None if record.get("to") else (record.get("room") or None),
+                                                   delivery=record["id"])
+                                store.acknowledge(record["id"])
+                                continue
+                            if record.get("kind") == "comment":
+                                client._request("POST", f"{protocol_prefix}/comments", json={
+                                    "subject": record["subject"], "id": record["subject_id"],
+                                    "text": record["text"], "collab_worker_delivery": record["id"]})
+                                store.acknowledge(record["id"])
+                                continue
+                            client.send(Envelope(kind=KIND_CHAT, text=record["text"], sender=profile.name,
+                                                 to=record.get("to") or None,
+                                                 room=None if record.get("to") else (record.get("room") or None),
+                                                 thread=record.get("thread") or None,
+                                                 body={**(record.get("body") or {}),
+                                                       "collab_worker_delivery": record["id"]}))
+                            store.acknowledge(record["id"])
+                except HubError as exc:
+                    left = len(store.outbox())
+                    store.off()
+                    warn(f"{left} queued message(s) could not be delivered now ({exc}); they are kept "
+                         "and go out, in order, the next time the worker is started")
+                    ok("collaboration worker disabled; pending decisions and replies are preserved")
+                    return 0
             store.off()
             ok("collaboration worker disabled; pending decisions and replies are preserved")
         elif args.worker_action == "reply":
@@ -6259,6 +6478,31 @@ def _new_proposal_id() -> str:
     return "fs_" + secrets.token_hex(4)
 
 
+def _queue_comment(profile: SessionProfile, subject: str, subject_id: str,
+                   text: str) -> int | None:
+    """Route a board comment through the enabled worker; None means post it.
+
+    R3: the worker is this participant's one voice while it is on, and a
+    comment is delivered verbatim and in order with the rest of its messages.
+    """
+    from .worker import Store
+    store = Store(profile.dir)
+    if not store.enabled():
+        return None
+    try:
+        record_id = store.queue_comment(subject, subject_id, text)
+    except ValueError as exc:
+        fail(str(exc))
+        return 1
+    try:
+        onboard.ensure_daemon(profile, wait=False)
+    except (OSError, RuntimeError, HubError):
+        pass
+    ok(f"queued for delivery by your worker: {record_id}")
+    print(dim("  `collab worker status` shows it until it is delivered"))
+    return 0
+
+
 def _send_body(profile: SessionProfile, text: str,
                body: dict[str, Any]) -> bool:
     """Say something in the room with a body on it. False if the hub refused.
@@ -6267,6 +6511,17 @@ def _send_body(profile: SessionProfile, text: str,
     message rides in a chat's body — the same door learnings use. Nothing
     hub-side reads it; the exchange is between daemons.
     """
+    from .worker import Store
+    store = Store(profile.dir)
+    if store.enabled():
+        # R3: proposals and votes are messages too; the worker's outbox is
+        # this participant's one voice while it is on.
+        try:
+            store.send(text, to="", room=profile.room or "general", body=body)
+        except ValueError as exc:
+            fail(str(exc))
+            return False
+        return True
     env = Envelope(kind=KIND_CHAT, text=text, sender=profile.name,
                    room=profile.room, body=body,
                    stats=_current_stats(profile))
@@ -7680,6 +7935,11 @@ def build_parser() -> argparse.ArgumentParser:
     ac.add_argument("--json", action="store_true")
     add_session_flag(ac)
     ac.set_defaults(func=cmd_activity)
+
+    dash = sub.add_parser("dashboard", help="everyone's quota and skills, kept current by the daemon")
+    dash.add_argument("--json", action="store_true")
+    add_session_flag(dash)
+    dash.set_defaults(func=cmd_dashboard)
 
     stt = sub.add_parser("stats", help="what each agent reports about its own usage")
     stt.add_argument("--json", action="store_true")

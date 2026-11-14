@@ -419,12 +419,13 @@ def taken(root: Path | str) -> bool | None:
 def argv(pid: int) -> list[str]:
     """How a process describes ITSELF, rather than how a file describes it.
 
-    /proc/<pid>/cmdline where there is a /proc, and `ps -o command=` where
-    there is not — macOS, the BSDs — which hands the words back joined by
-    spaces and so has to be split on them again. That is approximate in one
-    direction only: an argument containing a space comes back as two words,
-    and a long command line may have been truncated before we ever see it.
-    Both lose a match rather than inventing one.
+    /proc/<pid>/cmdline where there is a /proc, and bounded wide
+    `ps -ww -o command=` where there is not — macOS, the BSDs. The fallback
+    caps the whole exchange at 2 seconds/64 KiB and rejects failed or oversized
+    output, but still reconstructs words by whitespace. It cannot recover
+    original argument boundaries or quoting: this remains an approximate ps
+    description rather than the kernel's exact argv. It may lose a match or
+    split one argument into words resembling several arguments.
 
     Safe wherever it is used as an extra condition on a signal: it can withhold
     permission but never grant it, so where it cannot be read nothing is
@@ -442,12 +443,20 @@ def argv(pid: int) -> list[str]:
 
 
 def _ps_argv(pid: int) -> list[str]:
+    import shlex
+    from ..source_command import run
+
+    # COLUMNS=80 truncated even a 95-byte owned daemon command before its
+    # module/session markers. The 64 KiB cap is over 200 times the measured
+    # 275-byte long-interpreter command. Ask the actual ps host for wide output,
+    # but cap the whole exchange: an oversized or stalled response proves no
+    # identity. The shared runner bounds both pipes and reaps its own group.
     try:
-        out = subprocess.run(["ps", "-p", str(pid), "-o", "command="],
-                             capture_output=True, text=True, timeout=2, check=False)
+        out = run("exec " + shlex.join(["ps", "-ww", "-p", str(pid), "-o", "command="]),
+                  timeout=2, max_bytes=64 * 1024)
     except (OSError, subprocess.SubprocessError):
         return []
-    return out.stdout.split()
+    return out.stdout.split() if out.returncode == 0 else []
 
 
 def environ(pid: int) -> dict[str, str]:

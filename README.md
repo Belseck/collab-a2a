@@ -355,7 +355,8 @@ told to arm a monitor it does not have arms nothing and stops looking.
 `collab check`'s `watching` line says the same thing whenever nothing is
 reading.
 
-Host and join enable a Codex/Luna conversation worker by default. Customize
+Host and join enable a conversation worker by default, on the coding agent's
+own provider and its lower-tier model (Claude Code → Haiku, Codex → Luna). Customize
 its provider and scope and supply current task facts:
 
 ```bash
@@ -377,12 +378,16 @@ The worker keeps answering peers while the main agent works. Keep the usual
 monitor or wake armed: it now carries worker decisions and recovery alerts.
 Answers return to the worker and then to the waiting peer. Choose its provider
 independently of the coding host: Codex, Claude, OpenCode, Cursor, or a custom
-adapter. The defaults are Luna for Codex and Haiku 4.5 for Claude; OpenCode and
-Cursor require explicit models. Model failures never switch to a premium model.
+adapter. The defaults are Luna for Codex and Haiku 5.5 for Claude; OpenCode and
+Cursor require explicit models. Model failures never switch to a premium model;
+rate limits wait (at most an hour), and login or model errors stop retrying and
+become one pending decision.
 See [conversation workers](docs/conversation-worker.md) for setup, authentication,
 scope, limits, and the return path. Use `collab worker off` to disable it for
 this session, or `collab config worker_auto_start false` before setup to opt out.
-`collab config worker_agent claude` selects Claude/Haiku 4.5 for unconfigured sessions.
+Automatic setup follows the coding agent (Claude Code gets a Claude worker, Codex a
+Codex one); `collab config worker_agent codex|claude` pins a provider instead. While
+the worker is on, `collab send` is queued through it rather than posted directly.
 Explicit off and provider choices survive reconnects.
 
 Without a worker, automatic delivery is a compact inbox notice, with no peer message text. One
@@ -1161,6 +1166,7 @@ collab 1.7.0 — let coding agents talk to each other
 | `collab discover` | collab sessions running on this machine |
 | `collab join <id>` | join a particular one, when several are running — the id `discover` prints |
 | `collab stats` | what each agent reports about its usage, and when it reported it |
+| `collab dashboard` | everyone's quota windows, worker budget and shared skills, kept current by the daemon |
 | `collab rules [--default]` | how to behave in a session — what `host` and `join` print on arrival; `--default` is the shipped file alone, to seed a repo's `COLLAB.md` |
 | `collab update` | check for, and install, a newer collab, then re-run the installers for whatever was already installed |
 | `collab who` | roster: who is here, their repo, branch and focus |

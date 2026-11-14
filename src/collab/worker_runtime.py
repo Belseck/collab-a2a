@@ -47,6 +47,34 @@ _MODEL = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/@+-]{0,199}\Z")
 class WorkerRuntimeError(RuntimeError):
     """A turn failed without consuming inbox messages or sending proposals."""
 
+    def __init__(self, message: str, *, kind: str = "", retry_after: float = 0.0):
+        super().__init__(message)
+        self.kind, self.retry_after = kind, retry_after
+
+
+#: Provider stderr is read for its CLASS only: never stored, never shown.
+EXIT_CLASSES = (
+    ("rate_limit", re.compile(r"rate.?limit|\b429\b|too many requests|usage limit|quota exceeded|overloaded", re.I)),
+    ("auth", re.compile(r"\b(401|403)\b|unauthori[sz]ed|not logged in|please (run )?/?log ?in|authenticat|invalid api key|credential", re.I)),
+    ("model", re.compile(r"model\b[^\n]{0,40}\b(not found|not available|unknown|invalid|does not exist)|unknown model", re.I)),
+    ("network", re.compile(r"ECONN\w*|ETIMEDOUT|ENOTFOUND|getaddrinfo|connection (refused|reset)"
+                           r"|\b(HTTP|status)\s*5\d\d\b|\b5\d\d (internal|bad gateway|service unavailable)", re.I)),
+)
+RETRY_AFTER = re.compile(r"(?:retry|try again)[^\n]{0,20}?\b(\d{1,5})\s*(s|sec|secs|seconds|m|min|mins|minutes|h|hr|hrs|hours)\b", re.I)
+#: A provider's stated wait is peer-influenced text: never trust more than this.
+MAX_PROVIDER_WAIT = 3600.0
+
+
+def classify_exit(stderr_tail: bytes) -> tuple[str, float]:
+    """(class, seconds to wait if the provider said) from the last bytes of stderr."""
+    text = stderr_tail.decode("utf-8", "replace")
+    kind = next((name for name, pattern in EXIT_CLASSES if pattern.search(text)), "other")
+    wait = 0.0
+    if (m := RETRY_AFTER.search(text)) is not None:
+        unit = m.group(2).lower()
+        wait = float(m.group(1)) * (3600 if unit.startswith("h") else 60 if unit.startswith("m") else 1)
+    return kind, min(wait, MAX_PROVIDER_WAIT)
+
 
 def _object(properties: dict) -> dict:
     return {"type": "object", "properties": properties,
@@ -147,6 +175,59 @@ def validate_result(value: object) -> dict:
         if type(escalation["seq"]) is not int or escalation["seq"] < 0:
             raise WorkerRuntimeError("Worker returned an invalid message sequence")
     return value
+
+
+# A reply that defers to the main agent ("hold tight", "I'll get back to you")
+# is a promise only an escalation keeps. Models were observed making it with no
+# escalation, so the question never reached the main agent: loss by omission.
+DEFERRAL = re.compile(
+    r"\b(hold tight|stand by|get back to you|circle back|will update you"
+    r"|i(?:['\u2019]|\s+wi)ll (check and|confirm and|ask and|find out|let you know|update you)"
+    r"|(check|confirm) with (my|the) (human|main|user|lead)|as soon as i (have|hear|get)"
+    r"|te (aviso|confirmo|respondo)|d[ée]jame (revisar|confirmar|preguntar) y)\b",
+    re.IGNORECASE)
+
+
+def unrouted_deferrals(result: dict, selected: list[dict], pending: list[dict],
+                       answered: dict[str, int] | None = None) -> list[dict]:
+    """Escalations for deferring replies the model did not route itself.
+
+    A peer the turn escalated about, or one already waiting on a pending
+    decision, has had its question routed; only the silent promise is repaired.
+    """
+    # Routed already: the message itself has an escalation this turn or a
+    # pending one. By message, not by peer: a peer already waiting on one
+    # decision may ask a NEW question, and that one must be routed too.
+    waiting = {row.get("seq") for row in pending} | {e["seq"] for e in result["escalations"]}
+    added = []
+    for reply in result["replies"]:
+        if not DEFERRAL.search(reply["text"]):
+            continue
+        # A peer whose question the main agent answered this turn is being
+        # given that answer, however the worker words it; a decision about
+        # the relay would loop. By peer, not by matching the text.
+        # Scoped to the answered message: a follow-up from the same peer, newer
+        # than what was answered, is a new question and is still routed.
+        answered = answered or {}
+        if reply["to"] in answered and not any(
+                e["sender"] == reply["to"] and e["seq"] > answered[reply["to"]] for e in selected):
+            continue
+        # The peer's own message, else the newest message in the same named
+        # room; never someone else's DM.
+        source = ([e for e in selected if e["sender"] == reply["to"]]
+                  or [e for e in selected if reply["room"] and not e.get("to")
+                      and e.get("room", "") == reply["room"]])
+        if not source:
+            continue  # nothing to ask about: a decision with no question loops
+        seq = source[-1]["seq"]
+        if seq in waiting or any(a["seq"] == seq for a in added):
+            continue
+        asked = source[-1]["text"][:1000]
+        added.append({"reason": "decision", "seq": seq, "question": (
+            f"Your worker told {reply['to'] or 'the room'} it would get back to them "
+            f"without routing the question to you. Their message: {asked!r}. "
+            "What should it answer?")})
+    return added
 
 
 def _json(data: bytes | str) -> object:
@@ -315,15 +396,18 @@ async def _exchange(args: list[str], data: bytes, scratch: Path, env: dict[str, 
     async def read(stream: asyncio.StreamReader, keep: bool) -> bytes:
         nonlocal consumed
         chunks = []
+        tail = b""
         while True:
             chunk = await stream.read(8192)
             if not chunk:
-                return b"".join(chunks)
+                return b"".join(chunks) if keep else tail
             consumed += len(chunk)
             if consumed > MAX_OUTPUT_BYTES:
                 raise WorkerRuntimeError("Worker exceeded the output byte limit")
             if keep:
                 chunks.append(chunk)
+            else:
+                tail = (tail + chunk)[-4096:]  # classification only; never stored
 
     async def write() -> None:
         try:
@@ -354,8 +438,11 @@ async def _exchange(args: list[str], data: bytes, scratch: Path, env: dict[str, 
         if proc.returncode:
             # Never copy provider stderr into main-thread notices: it can
             # contain the prompt, credential-bearing URLs, or hostile text.
+            # Only its class is kept.
+            kind, wait = classify_exit(values[1])
             raise WorkerRuntimeError(
-                f"Worker provider exited with status {proc.returncode}; check model, authentication and CLI version")
+                f"Worker provider exited with status {proc.returncode} ({kind.replace('_', ' ')})",
+                kind=kind, retry_after=wait)
         return values[0]
     except asyncio.TimeoutError as exc:
         raise WorkerRuntimeError("Worker timed out") from exc
