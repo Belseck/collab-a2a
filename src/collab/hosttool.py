@@ -33,6 +33,8 @@ not have arms nothing and believes it is listening.
 from __future__ import annotations
 
 import os
+import subprocess
+from typing import Callable
 
 #: The env var, the value it must have (or None for «set to anything»), the
 #: key, and where the marker is documented. Order matters only where a tool
@@ -93,16 +95,56 @@ NO_WATCHER = ("codex",)
 HOLDS_A_WATCHER = ("claude-code",)
 
 
-def detect(env: dict[str, str] | None = None) -> str:
-    """The tool running us, or '' when nothing here announces itself."""
+#: What `detect` says when more than one tool announced itself and the process
+#: chain could not say which of them is nearest. Not a tool and not «nothing»:
+#: it is «somebody, and collab cannot say who», which telemetry records as an
+#: unknown quota rather than crediting either tool.
+NESTED = "nested"
+
+
+def detect(env: dict[str, str] | None = None, *,
+           chain: Callable[[], list[str]] | None = None) -> str:
+    """The tool running us, or '' when nothing here announces itself.
+
+    MARKERS ARE INHERITED, so two of them mean nesting. Gemini CLI started from
+    inside a Codex thread runs its commands with CODEX_THREAD_ID still set, and
+    the first-match rule called that Codex: setup armed `stats --probe codex`
+    with the parent's thread and published the Codex account's quota as the
+    Gemini participant's own. The marker order cannot settle it — Codex inside
+    Gemini looks the same — so a tie is settled by the agent PROCESSES above us.
+
+    EVERY MARKER MUST BE ACCOUNTED FOR, or the answer is NESTED. Taking merely
+    the nearest named process let an unrecognised inner tool — a wrapper, a
+    launcher collab has no name for — under a named Codex hand the answer to
+    Codex, which is the same misattribution by another road. The accepted cost:
+    a stale inherited marker (a CLAUDECODE exported into a tmux server, say)
+    with no Claude process above us now reads as NESTED, an unknown quota,
+    rather than as whichever tool is actually running — unknown, never a guess.
+    """
     source = os.environ if env is None else env
+    found: list[str] = []
     for name, wanted, key, _docs in MARKERS:
         value = (source.get(name) or "").strip()
         if not value:
             continue
-        if wanted is None or value.lower() == wanted:
-            return key
-    return ""
+        if (wanted is None or value.lower() == wanted) and key not in found:
+            found.append(key)
+    if len(found) <= 1:
+        return found[0] if found else ""
+    above = (chain or agents_above)()
+    if not all(kind in above for kind in found):
+        return NESTED
+    # Every marker has its process; the nearest of them is the one running us.
+    return next(kind for kind in above if kind in found)
+
+
+def agents_above() -> list[str]:
+    """The kinds of the agent processes above us, nearest first, or [] on error."""
+    from . import lockfile, owner
+    try:
+        return owner.kinds_in(lockfile.ancestry())
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return []
 
 
 def name_of(kind: str) -> str:

@@ -83,14 +83,15 @@ by contrast, lives outside the checkout, isolated by repository and agent sessio
 .venv/bin/collab host --focus "<what you are working on>"
 ```
 
-**If this repo has hosted a session before, ask the user first.** By default
+**Honor the user’s session choice; ask only when the choice is ambiguous.** By default
 this resumes the last one, keeping its conversation and task board:
 
 > There's a previous session here — "auth refactor", 142 messages and 3 open
 > tasks. Carry on with it, or start a fresh one?
 
 ```bash
-.venv/bin/collab sessions            # what is there, and what each holds
+.venv/bin/collab sessions            # saved hosts and guests, including working paths
+.venv/bin/collab resume <id>        # reconnect saved identity from its working path
 .venv/bin/collab host                # resume the most recent (default)
 .venv/bin/collab host --fresh        # start empty instead
 .venv/bin/collab host --resume <id>  # resume a particular one
@@ -588,8 +589,16 @@ keeps the same tokens, so they only need to re-share the current link:
 
 Claude Code and Codex participants configure their own telemetry route on host,
 join and daemon startup by default. Claude preserves existing statusline
-segments; Codex binds its probe to the participant's exact thread. Explicit
-sources and cleared sources take precedence. `stats_auto_setup false` disables
+segments; Codex binds its probe to the participant's exact thread.
+Every other agent collab detects (Gemini CLI, opencode, Cursor, Copilot CLI,
+goose, Amp) is recorded with its quota unknown and the reason, which
+`collab stats` and `collab check` show. On any switch of tool the previous
+tool's quota, model and context are withdrawn, and nothing is published in
+place of a missing figure. Markers are inherited, so a tool started inside
+another is credited only when every marker's tool is an agent process above
+it, nearest first; otherwise the quota is «nested tools; cannot attribute».
+A stale inherited marker therefore reads as unknown – the accepted cost.
+Explicit sources and cleared sources take precedence. `stats_auto_setup false` disables
 future automatic setup and automatic polling, without removing existing hooks.
 Main and worker usage remain separate; native worker usage continues to collect.
 Roster/activity refresh and chat delivery do not wait for slow usage commands.

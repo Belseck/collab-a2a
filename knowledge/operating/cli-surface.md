@@ -41,7 +41,8 @@ the live parser by `tests/test_okf_bundle.py`, which extends the same list the
 |---|---|
 | `host` | start a session and print a link to share |
 | `kill` | end a session (its data is kept unless `--purge`) |
-| `sessions` | sessions this repo has hosted before |
+| `sessions` | saved host and guest sessions for the selected participant |
+| `resume <id>` | resume a saved session in its original working path |
 | `lock` | who is using this repo's collab state |
 | `join` | join a session — with no arguments, the one running on this machine |
 | `send` | send a message |
@@ -268,7 +269,8 @@ the daemon never reserves it. See the current settings guide for delivery gates.
 
 `collab remote` provides offer, pending, show, bind, accept, decline and goal
 operations. The host's connection goal is an offer; each receiving human must
-accept locally. Noninteractive `--human-approved` attests an actual human
-approval of `--sha256`, never permission inferred from remote text. See the
+accept locally through a fresh controlling-terminal challenge outside the
+coding agent. No flag, stdin response or content hash grants approval. See the
 [remote request guide](../../docs/remote-requests.md). The historical parser
 pin above is unchanged.
+> Later than the bundle pin: saved guest/host listing and explicit path-preserving resume were added by R8; historical verification stamps remain unchanged.

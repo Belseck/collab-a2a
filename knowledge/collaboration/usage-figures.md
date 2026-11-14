@@ -306,3 +306,17 @@ usage remains separate. Independent refresh tasks prevent slow usage commands
 from blocking activity, roster and chat; the default roster refresh is three
 seconds, and a fetch older than 30 seconds is unknown even with a live feed.
 This observation does not move the bundle pin or its verified stamps.
+
+## Later than the pin – quota routes per detected tool
+
+Every tool `hosttool.detect` can name has a row in `collab.quota_sources`:
+Claude Code by its status line hook, Codex by its app-server probe, and every
+other tool with no route, so its quota is recorded as unknown with the reason.
+A participant that switches tool loses the earlier route and its stored
+windows, model and context, rather than publishing another tool's account as
+its own. Inherited markers are credited only when every marker's tool is an
+agent process above, nearest first; otherwise the quota is recorded as «nested
+tools; cannot attribute», which a stale marker also reads as.
+Gemini CLI 0.32.1 was read and keeps its quota in process memory only. The
+Codex model now comes from the last turn record in the rollout tail. This
+observation does not move the bundle pin or its verified stamps.

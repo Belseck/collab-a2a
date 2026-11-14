@@ -30,12 +30,19 @@ def ensure(profile) -> None:
     from .worker_telemetry import _write
     if not get('stats_auto_setup') or not share_stats_enabled():
         return
+    from .quota_sources import unknown_reason
     previous = state(profile)
     provider = detect()
     # A plain-terminal reconnect has no authority to replace an established
     # host, but an explicitly identified new thread must replace its predecessor.
-    if provider not in ('codex', 'claude-code'):
+    if not provider:
         return
+    # AN IDENTIFIED TOOL WITH NO ROUTE STILL REPLACES THE OLD ONE. Returning
+    # here for anything but Codex and Claude left a participant that rejoined
+    # under Gemini CLI with its earlier Codex route: `source` kept arming
+    # `--probe codex` with the old thread id, and the Codex account's windows
+    # were published under a Gemini participant. Recording the tool and why
+    # its quota is unknown is what takes that route away.
     thread = (os.environ.get('CODEX_THREAD_ID') or os.environ.get('CODEX_SESSION_ID') or '') if provider == 'codex' else ''
     explicit = 'stats_command' in load_config()
     if (previous.get('provider') == provider and previous.get('thread_id', '') == thread
@@ -43,6 +50,21 @@ def ensure(profile) -> None:
         return
     value = {'provider': provider, 'thread_id': thread, 'explicit': explicit,
              'at': time.time(), 'error': ''}
+    # ON ANY SWITCH, NOT ONLY TO A TOOL WITH NO SOURCE. Claude Code → Codex kept
+    # Claude's five-hour window on file until a Codex probe succeeded — which
+    # may be never — so the room saw one tool's allowance under the other.
+    # The previous tool's figures go first; the new route fills them again.
+    # Only when no explicit source owns the figures: those are the person's.
+    if previous.get('provider') not in ('', None, provider) and not explicit:
+        _forget_previous_tool(profile)
+    # ITS OWN KEY, NOT `error`. `collab check` reports a non-empty `error` as
+    # «automatic telemetry setup failed», which this is not — setup did exactly
+    # what it should — and an `error` would also defeat the unchanged-state
+    # return above, rewriting this file on every join and daemon start.
+    if (why := unknown_reason(provider)):
+        value['quota_unknown'] = why
+        _write(profile.dir / 'telemetry-setup.json', value)
+        return
     try:
         if provider == 'codex':
             value['thread_id'] = os.environ.get('CODEX_THREAD_ID') or os.environ.get('CODEX_SESSION_ID') or ''
@@ -57,6 +79,30 @@ def ensure(profile) -> None:
     except (OSError, ValueError, TypeError) as exc:
         value['error'] = type(exc).__name__
     _write(profile.dir / 'telemetry-setup.json', value)
+
+
+
+#: What describes the tool IN USE rather than the participant's history. On a
+#: switch these belong to the previous tool and are withdrawn; cost and token
+#: totals are what was spent, and stay, ageing on their own clocks.
+NOW_FIELDS = ('model', 'context_pct', 'context_tokens', 'context_limit')
+
+
+def _forget_previous_tool(profile) -> None:
+    """Withdraw the previous tool's quota, model and context, keeping the rest.
+
+    QUOTA AS `quotas: {}`, the rest as explicit null — the two spellings the
+    hub reads as «no longer true» (see `stats.sanitise`). Left in the file, the
+    daemon kept posting them: the roster showed a Gemini participant with the
+    Codex account's windows and `m:gpt-…`, a model it was not running.
+    """
+    from . import stats as statmod
+    stored = statmod.read_stats(profile)
+    held = [k for k in (*statmod.QUOTA_FIELDS, *NOW_FIELDS) if stored.get(k) not in (None, {}, '')]
+    if not held:
+        return              # nothing to take back, so nothing to rewrite
+    kept = {k: v for k, v in stored.items() if k not in statmod.QUOTA_FIELDS and k not in NOW_FIELDS}
+    statmod.write_stats(profile, {**kept, 'quotas': {}, **{k: None for k in NOW_FIELDS}})
 
 
 def source(profile) -> tuple[str, int, dict]:

@@ -6,6 +6,7 @@
 ## 2026-11-13
 * **Update (later than the pin)**: Recorded receiver-local remote prompt/goal consent, stable-recipient sends, goal offers at join, and exclusion from automatic wake/worker inputs. Historical verification stamps remain unchanged.
 * **Update (later than the pin)**: Added elapsed time and a rate-based ETA to [batches](collaboration/batches.md), measured from a new `tasks.completed_at` recorded in [the task board](collaboration/task-board.md). The pin and verification stamps are unchanged.
+* **Update (later than the pin)**: Recorded R8 saved host/guest sessions and explicit resume with original working paths. Historical pin and verification stamps are unchanged.
 
 ## 2026-09-20
 * **Update (2.1.1, later than the pin)**: Recorded shared participant identity and internal decision routing in the wake page; the bundle pin is unchanged.
@@ -110,3 +111,12 @@ polling is cancellable and bounded. The pin remains unchanged.
 - **Update (later than the pin)**: Recorded fixed-window roster coalescing,
   conditional private revalidation and finite JSON compression in the existing
   client-daemon architecture page. No pin or verified stamp changed.
+
+- Later than the pin: usage figures record a quota route for every detected tool;
+  tools with no local source, Gemini CLI among them, stay unknown with a reason.
+  Pin unchanged.
+
+- Later than the pin: usage figures now name the model that ran the last Codex
+  turn, and the hub publishes `main_model`, `worker_model` and
+  `model_changed_at` beside `model_observed_at`, with null for unknown. Pin
+  unchanged.

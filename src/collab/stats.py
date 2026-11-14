@@ -265,6 +265,30 @@ def _percent(value: Any, key: str = "") -> float | None:
     return round(number, 4)
 
 
+#: Unicode categories no figure needs: Cc is C0/C1 control (ESC, BEL, CR …),
+#: Cf is format — the bidi overrides and zero-width characters — and Zl/Zp are
+#: the line and paragraph separators. Cs, Co and Cn go too: a LONE SURROGATE
+#: (`"gpt\ud800x"`, which `json.loads` accepts) survived as a model and made
+#: the roster's UTF-8 encoding raise UnicodeEncodeError, so one report broke the
+#: roster for everyone; private-use and unassigned code points draw as nothing
+#: anybody can read.
+_UNPRINTABLE = frozenset(("Cc", "Cf", "Zl", "Zp", "Cs", "Co", "Cn"))
+
+
+def printable(text: str) -> str:
+    """`text` without anything that is an instruction rather than a character.
+
+    THESE STRINGS ARE DRAWN ON OTHER PEOPLE'S TERMINALS. A model name is chosen
+    by whoever reports it, and «\x1b[31mRED\x1b]0;title\x07» arrived on the
+    roster intact as `model` and `main_model` — colour codes and a window-title
+    rewrite for every participant whose plain-print path showed it. A bidi
+    override does the quieter thing: «gpt» displayed backwards beside the real
+    one. `protocol.scrub` removes Cc only; a field also has no use for Cf.
+    """
+    import unicodedata
+    return "".join(ch for ch in text if unicodedata.category(ch) not in _UNPRINTABLE)
+
+
 def _coerce(field: str, value: Any, key: str = "") -> Any | None:
     # NOTHING IS NOT A FIGURE. `str(None)` is `"None"`, so a JSON `null` used to
     # coerce into the four-letter STRING for every text field — `collab stats
@@ -276,7 +300,7 @@ def _coerce(field: str, value: Any, key: str = "") -> Any | None:
     kind = CANONICAL[field]
     try:
         if kind is str:
-            text = str(value).strip()
+            text = printable(str(value)).strip()
             return text[:MAX_STRING] or None
         if isinstance(value, bool) or not math.isfinite(float(value)) or float(value) < 0:
             return None
@@ -614,6 +638,59 @@ def whole_picture(figures: dict[str, Any]) -> dict[str, Any]:
     return {**figures, "quotas": {}}
 
 
+#: The published model summary, derived on the hub from what was merged. The
+#: names are a contract with the dashboard: `main_model`, `worker_model`, and
+#: `model_changed_at` beside the existing `model_observed_at`. Null is unknown.
+MODEL_SUMMARY = ("main_model", "worker_model", "model_changed_at")
+
+#: What `worker_usage` records as `last_model` when one call used several.
+MULTIPLE_MODELS = "multiple models"
+
+
+def model_summary(previous: dict[str, Any], merged: dict[str, Any],
+                  now: float) -> dict[str, Any]:
+    """Both models in use, and when the pair was last seen to change.
+
+    DERIVED, NEVER REPORTED. Whatever a participant posts under these names is
+    overwritten here: they restate `model` and the worker block's own model, so
+    a separately reported value could only ever disagree with them.
+
+    `model_changed_at` IS THE HUB'S CLOCK at the merge where the pair first
+    differed from the pair it replaced. The first observation is not a change —
+    nothing was seen before it — so it is null until a second model is seen,
+    rather than a «changed just now» that never happened. A model going from
+    known to unknown is a change; it is exactly what a withdrawn model is.
+    """
+    def name(value: Any) -> str | None:
+        text = printable(value).strip() if isinstance(value, str) else ""
+        return text[:150] or None
+
+    worker = merged.get("worker") if isinstance(merged.get("worker"), dict) else {}
+    worker_name = name(worker.get("last_model") or worker.get("model"))
+    # «MULTIPLE MODELS» IS NOT A MODEL. `worker_usage` writes it when one call
+    # used more than one, and a worker that sometimes reaches for a second
+    # model flipped `worker_model` between its name and this sentence — moving
+    # `model_changed_at` each time and publishing the sentence as a model. The
+    # last real name stands; a sentence about the call is not a change.
+    if worker_name == MULTIPLE_MODELS:
+        worker_name = previous.get("worker_model") if "worker_model" in previous else None
+    pair = (name(merged.get("model")),
+            # A worker that is OFF has no model in use; `worker.enabled` says
+            # off, and this says unknown rather than the last one it ran.
+            None if worker.get("enabled") is False else worker_name)
+    seen_before = "main_model" in previous or "worker_model" in previous
+    before = (previous.get("main_model"), previous.get("worker_model"))
+    changed = previous.get("model_changed_at")
+    if seen_before and pair != before:
+        changed = now
+    return {"main_model": pair[0], "worker_model": pair[1],
+            "model_changed_at": changed if isinstance(changed, (int, float)) else None,
+            "model_observed_at": (merged.get("model_observed_at")
+                                  if isinstance(merged.get("model_observed_at"), (int, float))
+                                  and not isinstance(merged.get("model_observed_at"), bool)
+                                  else None)}
+
+
 def sanitise(reported: dict[str, Any]) -> dict[str, Any]:
     """What is safe to put on everyone else's roster.
 
@@ -713,7 +790,7 @@ def sanitise(reported: dict[str, Any]) -> dict[str, Any]:
             out[key[:MAX_STRING]] = value
             extras += 1
         elif isinstance(value, str):
-            out[key[:MAX_STRING]] = value[:MAX_STRING]
+            out[printable(key)[:MAX_STRING]] = printable(value)[:MAX_STRING]
             extras += 1
     return out
 
