@@ -20,6 +20,7 @@ from ..protocol import (DEFAULT_ROOM, Envelope, KIND_CHAT, KIND_HELLO,
                         MessageRefused, RecipientChanged, message_refusal,
                         KIND_PRESENCE, bounded_meta)
 from .store import Store
+from .auth import RateLimiter
 
 QUEUE_MAXSIZE = 1000
 logger = logging.getLogger(__name__)
@@ -43,6 +44,9 @@ class Hub:
         self._lock = asyncio.Lock()
         self._publish_lock = asyncio.Lock()
         self.slow_subscriber_disconnects = 0
+        self._remote_senders = RateLimiter(limit=16, window=60)
+        self._remote_receivers = RateLimiter(limit=32, window=60)
+        self._remote_goals = RateLimiter(limit=16, window=60)
 
     @property
     def host_name(self) -> str:
@@ -76,7 +80,7 @@ class Hub:
 
     # --- publishing -----------------------------------------------------------
 
-    async def publish(self, env: Envelope) -> Envelope:
+    async def publish(self, env: Envelope, *, connection_goal: bool = False) -> Envelope:
         """Persist, then push to every participant entitled to see it."""
         # REFUSED HERE, where the two routes meet — the REST convenience path
         # and A2A `SendMessage` — so that neither can carry what the other
@@ -88,7 +92,17 @@ class Hub:
             raise RecipientChanged("recipient identity changed; review the destination before retrying")
         if env.kind == KIND_CHAT and (reason := message_refusal(env.text or "")):
             raise MessageRefused(reason)
-        if env.kind == KIND_HELLO and env.sender_id and env.body:
+        from ..remote_requests import OFFER_PREFIX, supports_remote_consent
+        if env.kind == KIND_CHAT and (expected_id is not None or (env.text or '').startswith(OFFER_PREFIX)):
+            recipient = self.store.participant_by_id(env.to_id) if env.to_id else None
+            if recipient is None or not supports_remote_consent(recipient.meta):
+                raise MessageRefused('recipient has not advertised supported remote consent')
+            from ..protocol import RemoteRateLimited
+            sender_budget = self._remote_goals if connection_goal else self._remote_senders
+            if (not env.sender_id or not sender_budget.allow(env.sender_id)
+                    or not self._remote_receivers.allow(recipient.id)):
+                raise RemoteRateLimited('remote offer rate exceeded; retry after 60 seconds')
+        if env.kind == KIND_HELLO and env.sender_id:
             # The host announces itself the same way a guest does, so its repo,
             # branch and focus show up in the roster like everyone else's.
             await asyncio.to_thread(self.merge_hello, env.sender_id, env.body)
@@ -173,6 +187,8 @@ class Hub:
             # straight over A2A with any body a participant likes, and it lands in
             # the roster the same way. See collab.protocol.bounded_meta.
             hello = bounded_meta(hello)
+            from ..remote_requests import supports_remote_consent
+            hello['remote_consent_version'] = 1 if supports_remote_consent(hello) else 0
             meta.update({k: v for k, v in hello.items() if v not in ("", None)})
 
 
@@ -407,11 +423,13 @@ class Hub:
 
     # --- snapshot -------------------------------------------------------------
 
-    def snapshot(self, viewer: str | None = None, *, history: int = 20) -> dict[str, Any]:
+    def snapshot(self, viewer: str | None = None, *, history: int = 20,
+                 remote_consent: bool = False) -> dict[str, Any]:
         """What a joining agent needs in order to say something useful at once.
 
         ``viewer`` is a participant id.
         """
+        from ..remote_requests import event_visible_to_receiver
         connected = self.connected()
         people = []
         for p in self.store.participants():
@@ -419,6 +437,7 @@ class Hub:
                 "id": p.id,
                 "name": p.name,
                 "is_host": p.is_host,
+                "remote_consent_version": p.meta.get("remote_consent_version", 0),
                 "connected": p.id in connected,
                 "focus": p.meta.get("focus", ""),
                 "repo": p.meta.get("repo", ""),
@@ -481,7 +500,8 @@ class Hub:
             # lower, the confusion between activity and conversation that
             # `unread_messages` had to be split off from `unread` to fix.
             "messages": self.store.count_kind(KIND_CHAT),
-            "recent": [e.to_dict() for e in self.store.history(viewer=viewer, limit=history)],
+            "recent": [e.to_dict() for e in self.store.history(viewer=viewer, limit=history)
+                       if event_visible_to_receiver(e, remote_consent)],
             "seq": self.store.max_seq(),
             "server_time": time.time(),
             "slow_subscriber_disconnects": self.slow_subscriber_disconnects,

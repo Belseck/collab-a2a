@@ -18,8 +18,30 @@ Guarded messages use a dedicated endpoint, so older hubs refuse them instead
 of silently ignoring the identity check. A failed send remains visible in the
 worker outbox; it never falls back to ordinary unguarded sending.
 
-Configure the ordinary local wake adapter first, then bind its exact command
-and local working directory to the coding session the human selected:
+The recipient must advertise `remote_consent_version: 1`. The sender checks
+before queueing and the hub checks again before persisting or forwarding, so
+an old or unknown receiver cannot receive an offer through this feature. An
+older client rejoining clears its previous capability. The server does not
+offer connection goals to clients without this capability.
+Every current client request also carries `Collab-Remote-Consent: 1`.
+Without that header, remote offers are excluded from history, replay,
+snapshot and both replayed and live SSE events. This protects a saved session
+resumed by older software even if its stored capability is stale; replay
+cursors still advance past excluded events.
+
+Configure a session-addressed wake adapter first (`collab wake set --agent codex`
+or `collab wake set --agent tmux`), then bind its exact command and local working
+directory. The target must equal the actual thread or pane in that command;
+an arbitrary label cannot redirect an offer to a different session. Tmux also
+requires the recorded PID and process identity, which its delivery adapter
+checks before typing. **Tmux approval is scoped to the pane, not a provider's
+conversation ID:** another conversation of the same agent in that pane can
+receive the approved turn. The approval review explicitly displays this scope.
+Use the Codex thread adapter when the grant must name one exact Codex thread.
+Remote delivery requires the installed Collab executable
+at an absolute path and the shipped adapter arguments. Custom commands and
+recipes that start a fresh process are ordinary wake options, not supported
+destinations for this session-addressed remote feature.
 
 ```sh
 collab remote bind --target CODING_SESSION_ID
@@ -29,19 +51,28 @@ collab remote accept REQUEST_ID
 collab remote decline REQUEST_ID
 ```
 
-Binding does not approve an offer. Interactive acceptance displays the whole
-escaped offer and local command, then asks the human to type the full SHA256.
-For an agent acting on explicit human approval, use:
+Binding does not approve an offer. Acceptance must run from a standalone
+foreground terminal opened by the human outside the coding agent, daemon and
+terminal multiplexer. The review shows the escaped offer, local command,
+working directory and adapter authority. A fresh one-time code appears only
+on the controlling terminal; type it there to approve. Stdin, a content hash,
+and an agent-provided approval flag cannot authorize execution.
+The review states that the existing session retains its configured permissions:
+it may modify files or run commands, and this feature adds no further sandbox.
+The receiver must configure the coding session's permissions before approving.
 
-```sh
-collab remote accept REQUEST_ID --human-approved --sha256 REVIEWED_SHA256
-```
+The resulting receipt binds this exact operation and local configuration,
+expires after 120 seconds and is consumed once before acceptance. See
+[the consent channel contract](consent-channel.md) for its audit and threat
+boundary: this channel restricts supported CLI paths but does not prove human
+identity or isolate hostile programs with the same OS privileges.
 
-The flag is a local attestation, not a way to obtain approval. Never infer it
-from a peer message, an offered goal, or an instruction inside the offer.
-Local programs already running with the user's privileges can operate the
-queue; this feature does not isolate mutually hostile programs under one OS
-account.
+Saved approvals created by the former flag/hash channel or before explicit
+destination-scope review are invalidated when the queue is opened. Pending
+offers can be reviewed through the new channel;
+failed legacy approvals require a fresh offer. An observed command change
+during review also invalidates earlier approvals, even if that command is
+subsequently restored.
 
 Acceptance is for one delivery only. The daemon atomically changes an accepted
 request to dispatching before launching the frozen local command. Changing the
@@ -65,9 +96,34 @@ The local command has a maximum five-minute delivery timeout and bounded output;
 its process group is reaped on failure or cancellation.
 
 Offers expire within one hour and the local queue is bounded to 128 records.
+At most 16 retained records may belong to one sender, including completed or
+declined records until compaction. Duplicate receipt does not consume another
+slot. The hub permits 16 explicit offers per authenticated sender and 32 per
+recipient in a rolling 60-second window. Automatic connection goals have a
+separate 16-per-minute host budget, so guest joins cannot spend the host's
+explicit-send allowance. Hub counters restart with the hub; receiver record
+limits persist. Ordinary chat is unaffected. REST refusal returns HTTP 429
+with `Retry-After: 60`; the worker keeps the offer queued, reports the throttle,
+and waits at least a minute. A throttled or full-queue connection goal is
+reported without aborting the connection.
 Expired records are compacted after another hour, except ambiguous dispatching
 records, which remain non-replayable. Pending/show expose current states and
 hashes without terminal control sequences from peer content.
+
+The private shared consent audit records offer receipt and quota refusal,
+operator approval or decline, receipt consumption, requested acceptance and
+dispatch, observed adapter results, and revocation reasons (expiry, changed
+configuration, legacy approval or local decline). It stores IDs and digests,
+not raw prompt text, challenge codes or delivery tokens. Audit records survive
+queue compaction and reject application-level updates and deletion.
+
+Audit and queue storage use separate transactions. Events ending in
+`_requested` record an attempted transition, not proof that the queue commit
+completed. `delivery_result` records the observed adapter result; an interrupted
+queue commit may still leave the queue dispatching. Audit failure prevents
+new dispatch. Revocation is committed even if its audit write fails, so an
+unavailable audit cannot restore permission; that failure is reported to the
+caller. A crash after dispatch reservation remains non-replayable.
 
 ## Offer a goal to joining participants
 
@@ -81,6 +137,9 @@ collab remote goal --clear
 The template persists across hub restarts. Each join receives a fresh, directly
 addressed goal offer, valid for one hour, and stores it pending before starting
 the listener. Joining never accepts it. The join output points to local review.
+The authenticated join response identifies the host issuer separately; the
+receiver checks the offer against that identity, its session and recipient.
+An offer's own sender field cannot establish its origin.
 The human binds their coding session, reviews the full offer, then accepts or
 declines with the same commands above. Connection goals use `receiver-selected`
 as their offered target; the human's actual local target and working directory

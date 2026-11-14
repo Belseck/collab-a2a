@@ -2,11 +2,10 @@
 from __future__ import annotations
 
 import json
-import sys
 
-from . import wake
-from .remote_requests import Inbox, make_offer, wire_text, digest
-from .remote_delivery import working_directory
+from . import consent, wake
+from .remote_requests import Inbox, make_offer, wire_text, digest, binding_digest, supports_remote_consent
+from .remote_delivery import working_directory, destination
 
 
 def run(args, profile):
@@ -36,6 +35,8 @@ def run(args, profile):
         if len(matches) != 1 or not matches[0].get('id'):
             raise ValueError('recipient must identify one authenticated participant')
         person = matches[0]
+        if not supports_remote_consent(person):
+            raise ValueError('recipient has not advertised supported remote consent; update and reconnect it first')
         offer = make_offer(session_id=profile.session_id, sender_id=profile.participant_id,
                            recipient_id=person['id'], target=args.target,
                            kind=args.kind, text=args.text)
@@ -51,8 +52,11 @@ def run(args, profile):
     if action == 'bind':
         if not args.target:
             raise ValueError('--target must name the local coding session')
+        actual = destination(command)
+        if actual['session_id'] != args.target:
+            raise ValueError('--target must equal the actual wake adapter session id')
         inbox.bind(args.target, command, cwd)
-        print(json.dumps({'target': args.target, 'cwd': str(cwd), 'bound': True,
+        print(json.dumps({'target': args.target, 'actual_destination': actual, 'cwd': str(cwd), 'bound': True,
                           'authorizes_execution': False}, ensure_ascii=True))
         return 0
     if not args.request_id:
@@ -70,18 +74,26 @@ def run(args, profile):
         print('Declined locally.')
         return 0
     target = inbox.bound_target(command, cwd)
-    approved = args.human_approved
-    reviewed = args.sha256
-    if not approved:
-        if not sys.stdin.isatty():
-            raise ValueError('explicit human consent required: review with show, then use --human-approved and --sha256')
-        print(json.dumps({'local_target': target, 'local_command': command, 'local_cwd': str(cwd)}, ensure_ascii=True))
-        approved = input('To authorize this exact request once, type its full SHA256: ').strip() == row['sha256']
-        reviewed = row['sha256'] if approved else ''
-    if not reviewed:
-        raise ValueError('--sha256 must identify the exact content reviewed by the human')
-    inbox.accept(args.request_id, reviewed_digest=reviewed,
+    try:
+        actual = destination(command)
+        if actual['session_id'] != target:
+            raise ValueError('bound target differs from the actual adapter session')
+    except ValueError:
+        inbox.invalidate('unsupported_or_changed_destination')
+        raise
+    receipt = consent.request(
+        profile.dir, subject='remote', request_id=args.request_id,
+        digest=row['sha256'], binding=binding_digest(target, command, cwd),
+        review={'offer': row, 'local_target': target, 'actual_destination': actual, 'local_command': command,
+                'local_cwd': str(cwd),
+                'authority': 'Uses the existing coding session permissions; may modify files and run commands. No additional sandbox is applied.'})
+    current_command = list(wake.read_config(profile.dir).command)
+    current_cwd = working_directory(profile)
+    current_target = inbox.bound_target(current_command, current_cwd)
+    if (current_command != command or current_cwd != cwd or current_target != target):
+        raise ValueError('local delivery configuration changed during review; review again')
+    inbox.accept(args.request_id, reviewed_digest=row['sha256'],
                  session_id=profile.session_id, recipient_id=profile.participant_id,
-                 target=target, command=command, human_approved=approved, cwd=cwd)
+                 target=target, command=command, approval=receipt, cwd=cwd)
     print('Accepted for one delivery to the bound local target.')
     return 0
