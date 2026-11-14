@@ -28,6 +28,11 @@ replacing a routed link with a guessed loopback address. A proxy 404 calls for
 checking the session ID and host status, not trying another session's invite.
 
 Both ends need stable Collab 2.x. An older host must be upgraded and restarted.
+Preserve the whole supplied join link, including any expected session-id hint
+and its invite fragment. Join through the original visible address or verified
+private same-machine discovery. Query local addresses/certificates cannot
+authorize credentials; the authenticated response may establish pinned local
+TLS for later traffic. Route changes retain identity and the SSE cursor.
 State lives outside the repository, isolated by workspace and agent session.
 Read the returned roster and shared work snapshot before proposing duplicate
 work. After joining succeeds, run `collab watch --tmux` when already inside tmux;
